@@ -201,26 +201,57 @@ def run_live_slam(key):
     # 🎨 SETUP LIVE PLOTTING (Upgraded to Overlapped UI)
     # ---------------------------------------------------------
     plt.ion()
+    # 🌟 Publication-level font and style setup (Science/Nature style)
+    plt.style.use('seaborn-v0_8-whitegrid')
+    plt.rcParams['font.family'] = 'sans-serif'
+    plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'Helvetica']
+    plt.rcParams['text.color'] = '#2c3e50'
+    plt.rcParams['axes.labelcolor'] = '#2c3e50'
+    plt.rcParams['xtick.color'] = '#2c3e50'
+    plt.rcParams['ytick.color'] = '#2c3e50'
+    
     fig = plt.figure(figsize=(18, 10)) 
     
     gs = fig.add_gridspec(3, 2, width_ratios=[1.5, 1], height_ratios=[1.5, 1.0, 1.0])
-    ax_map = fig.add_subplot(gs[:2, 0]); ax_map.set_title("Phase 3: Real-Time Map (Live Umeyama Alignment)")
+    ax_map = fig.add_subplot(gs[:2, 0])
+    ax_map.set_title("Phase 3: Real-Time Map (Live Umeyama Alignment)", fontsize=12, fontweight='bold', pad=10)
     
-    gs_top_right = gs[0, 1].subgridspec(3, 3, height_ratios=[0.4, 0.4, 1.0])
+    # 🌟 NEW: Unified Right-Column SubGridSpec to prevent overlap and irregular grids
+    # reduced hspace from 0.60 to 0.42 to tighten gaps between panels
+    gs_right = gs[:2, 1].subgridspec(4, 1, height_ratios=[0.25, 0.25, 1.0, 1.0], hspace=0.42)
     
-    ax_place = fig.add_subplot(gs_top_right[0, :])
-    ax_place.set_title("Place Cell Analog Activation (I_place)", fontsize=10)
-    ax_place.set_yticks([])
+    ax_place = fig.add_subplot(gs_right[0])
+    ax_place.set_title("Place Cell Analog Activation (I_place)", fontsize=10, fontweight='bold', pad=6)
+    ax_place.set_xticks([]); ax_place.set_yticks([])
     
-    ax_grid_flat = fig.add_subplot(gs_top_right[1, :])
-    ax_grid_flat.set_title("Spatial Grid Key (579-dim Flattened)", fontsize=10)
-    ax_grid_flat.set_yticks([])
+    ax_grid_flat = fig.add_subplot(gs_right[1])
+    ax_grid_flat.set_title("Spatial Grid Key (579-dim Flattened)", fontsize=10, fontweight='bold', pad=6)
+    ax_grid_flat.set_xticks([]); ax_grid_flat.set_yticks([])
     
-    ax_cann1 = fig.add_subplot(gs_top_right[2, 0])
-    ax_cann2 = fig.add_subplot(gs_top_right[2, 1])
-    ax_cann3 = fig.add_subplot(gs_top_right[2, 2])
-
-    ax_1d = fig.add_subplot(gs[1, 1]); ax_1d.set_title("1D Heading: Memory (Purple) vs CANN Belief (Orange)")
+    # 🌟 Aligned horizontal row for the three Grid Attractors
+    gs_cann = gs_right[2].subgridspec(1, 3, wspace=0.25)
+    ax_cann1 = fig.add_subplot(gs_cann[0])
+    ax_cann2 = fig.add_subplot(gs_cann[1])
+    ax_cann3 = fig.add_subplot(gs_cann[2])
+    
+    ax_cann1.set_title("CANN 1 (13x13)", fontsize=8, fontweight='bold', pad=4)
+    ax_cann2.set_title("CANN 2 (11x11)", fontsize=8, fontweight='bold', pad=4)
+    ax_cann3.set_title("CANN 3 (7x7)", fontsize=8, fontweight='bold', pad=4)
+    
+    # 🌟 Grid Cell Plot Grids: Enable grid line separators for a professional neural grid aesthetic
+    ax_cann1.set_xticks(np.arange(CANN_SIZES[0])); ax_cann1.set_yticks(np.arange(CANN_SIZES[0]))
+    ax_cann2.set_xticks(np.arange(CANN_SIZES[1])); ax_cann2.set_yticks(np.arange(CANN_SIZES[1]))
+    ax_cann3.set_xticks(np.arange(CANN_SIZES[2])); ax_cann3.set_yticks(np.arange(CANN_SIZES[2]))
+    
+    for ax in [ax_cann1, ax_cann2, ax_cann3]:
+        ax.set_xticklabels([])
+        ax.set_yticklabels([])
+        # subtle light white grid lines to separate the individual grid cells
+        ax.grid(True, which='both', color='white', linestyle='-', linewidth=0.5, alpha=0.25)
+    
+    # 🌟 Wide dedicated row for the Ring Attractor Heading
+    ax_1d = fig.add_subplot(gs_right[3])
+    ax_1d.set_title("1D Heading: Memory (Purple) vs CANN Belief (Orange)", fontsize=10, fontweight='bold', pad=6)
 
     ax_err = fig.add_subplot(gs[2, :]); ax_err.set_title("Live Absolute Trajectory Error (ATE)")
     ax_err.set_xlabel("Time (s)"); ax_err.set_ylabel("Position Error (meters)")
@@ -276,7 +307,12 @@ def run_live_slam(key):
     x_ring = np.arange(RING_N)
     line_ring_mem, = ax_1d.plot(x_ring, np.zeros(RING_N), color='#9B59B6', lw=3, label='Memory')
     line_ring_cann, = ax_1d.plot(x_ring, np.zeros(RING_N), color='#E67E22', lw=2, ls='--', label='CANN Belief')
-    ax_1d.set_ylim(-0.1, 1.1); ax_1d.set_xticks([])
+    ax_1d.set_ylim(-0.1, 1.1)
+    ax_1d.set_xlim(0, RING_N)
+    # 🌟 Restored circular angular x-ticks & grids for the ring attractor
+    ax_1d.set_xticks([0, 16, 32, 48, 64])
+    ax_1d.set_xticklabels(['0°', '90°', '180°', '270°', '360°'])
+    ax_1d.grid(True, which='both', alpha=0.3, ls='--')
     ax_1d.legend(loc='upper right')
 
     plt.show(block=False)
@@ -292,9 +328,15 @@ def run_live_slam(key):
     ui_smooth_t = np.zeros(2)
     history['live_offsets'] = [] 
     
-    gif_filename = "snn_live_run.gif"
-    print(f" 🎥 Recording live UI to {gif_filename} (Capturing every 15 steps)...")
-    gif_writer = imageio.get_writer(gif_filename, fps=10) 
+    # 🌟 NEW: Save GIF dynamically to the workspace root directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    root_dir = os.path.abspath(os.path.join(script_dir, ".."))
+    gif_filename = os.path.join(root_dir, "snn_live_run.gif")
+    
+    print(f" 🎥 Recording live UI (sliding window of last 300 frames for active loop closures)...")
+    # 🌟 INFINITE LOOP FIX: Pass loop=0 to force imageio to write the loop extension block so the GIF loops infinitely on GitHub!
+    gif_writer = imageio.get_writer(gif_filename, fps=10, loop=0) 
+    gif_frames = collections.deque(maxlen=300)  # Double time! Keeps last 30 seconds of execution
 
     # 🌟 NEW: Variables for HDC tracking and CLS Autopilot
     active_candidates = []
@@ -1168,11 +1210,12 @@ def run_live_slam(key):
                 fig.canvas.draw_idle()
                 fig.canvas.flush_events()
                 
+                # 🌟 RUNNING SAVES: Append to a sliding window of the last 300 frames (DPI=55 for publication aesthetic)
                 buf = io.BytesIO()
-                fig.savefig(buf, format='png', dpi=fig.dpi) 
+                fig.savefig(buf, format='png', dpi=55) 
                 buf.seek(0)
                 frame = imageio.v3.imread(buf, extension=".png") 
-                gif_writer.append_data(frame)
+                gif_frames.append(frame)
                 buf.close()
                 
             step += 1
@@ -1181,6 +1224,10 @@ def run_live_slam(key):
         elapsed = time.time() - t0
         print(f"\n 🛑 Halted! Simulated {step} steps in {elapsed:.1f}s.")
         
+        # 🌟 RUNNING SAVES: Write the sliding window FIFO queue frames to the gif!
+        print(f" 💾 Compiling the last {len(gif_frames)} frames into {gif_filename} (Capturing active loop closures!)...")
+        for f in gif_frames:
+            gif_writer.append_data(f)
         gif_writer.close()
         print(f" 💾 Saved live animation to {gif_filename}")
         

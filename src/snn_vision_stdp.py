@@ -9,6 +9,9 @@ Split-Brain Architecture: The Twin's adaptive feature extractor.
 Author: Ada 🦊
 """
 
+import os
+os.environ["JAX_PLATFORMS"] = "cpu"
+
 import jax
 import jax.numpy as jnp
 from jax import random
@@ -267,7 +270,11 @@ def evaluate_vision_stdp(key, events, tof_dists, learn=True):
         'active_neurons': active_neurons,
     }
 
-def create_stdp_debug_gif(results, batch_idx=0, save_path="stdp_debug.gif", step_skip=2):
+def create_stdp_debug_gif(results, batch_idx=0, save_path=None, step_skip=2):
+    if save_path is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        save_path = os.path.abspath(os.path.join(script_dir, "../stdp_debug.gif"))
+
     print(f"\n 🎬 Rendering STDP Diagnostic GIF to {save_path}...")
     events = results['events'][batch_idx]
     v_hidden = results['v_hidden_history'][:, batch_idx, :]
@@ -275,32 +282,48 @@ def create_stdp_debug_gif(results, batch_idx=0, save_path="stdp_debug.gif", step
     weights = results['weight_history']
     T = events.shape[0]
 
-    fig = plt.figure(figsize=(12, 8))
-    gs = GridSpec(2, 2, figure=fig, hspace=0.3, wspace=0.2)
+    # 🌟 Publication-level font and style setup
+    plt.style.use('seaborn-v0_8-whitegrid')
+    plt.rcParams['font.family'] = 'sans-serif'
+    plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'Helvetica']
+    plt.rcParams['text.color'] = '#2c3e50'
+    plt.rcParams['axes.labelcolor'] = '#2c3e50'
+    plt.rcParams['xtick.color'] = '#2c3e50'
+    plt.rcParams['ytick.color'] = '#2c3e50'
+
+    # Reduced dimensions/DPI for publication aesthetic and ultra-lightweight GIF size
+    fig = plt.figure(figsize=(10, 6.5))
+    gs = GridSpec(2, 2, figure=fig, hspace=0.35, wspace=0.25)
 
     ax_in = fig.add_subplot(gs[0, 0])
-    ax_in.set_title("Raw Event Camera Input (Moving Bar)", fontweight='bold')
+    ax_in.set_title("Raw Event Camera Input (Moving Bar)", fontsize=10, fontweight='bold', pad=8)
     ax_in.set_xlim(0, N_INPUT)
     ax_in.set_ylim(-0.1, 1.1)
-    line_in, = ax_in.plot([], [], 'k-', lw=2)
+    ax_in.set_xlabel("Pixel Channels", fontsize=8)
+    ax_in.set_ylabel("Normalized Intensity", fontsize=8)
+    line_in, = ax_in.plot([], [], color='#0984e3', lw=2)
 
     ax_v = fig.add_subplot(gs[0, 1])
-    ax_v.set_title("Membrane Potentials (Top 16 Neurons)", fontweight='bold')
+    ax_v.set_title("Membrane Potentials (Top 16 Neurons)", fontsize=10, fontweight='bold', pad=8)
     ax_v.set_xlim(0, 100) 
     ax_v.set_ylim(0, V_TH_STDP + THETA_MAX + 0.5) 
-    ax_v.axhline(V_TH_STDP, color='r', linestyle='--', alpha=0.5)
-    v_lines = [ax_v.plot([], [], lw=1.5, alpha=0.7)[0] for _ in range(16)]
+    ax_v.set_xlabel("Time Steps", fontsize=8)
+    ax_v.set_ylabel("Voltage (V)", fontsize=8)
+    ax_v.axhline(V_TH_STDP, color='#e74c3c', linestyle='--', alpha=0.6, label="Base Threshold")
+    v_lines = [ax_v.plot([], [], lw=1.2, alpha=0.5)[0] for _ in range(16)]
 
     ax_spk = fig.add_subplot(gs[1, 0])
-    ax_spk.set_title("Spike Raster (All 256 Neurons)", fontweight='bold')
+    ax_spk.set_title("Spike Raster (All 256 Neurons)", fontsize=10, fontweight='bold', pad=8)
     ax_spk.set_xlim(0, 100)
     ax_spk.set_ylim(0, N_HIDDEN)
-    scatter_spk = ax_spk.scatter([], [], s=5, c='blue', marker='|')
+    ax_spk.set_xlabel("Time Steps", fontsize=8)
+    ax_spk.set_ylabel("Neuron Index", fontsize=8)
+    scatter_spk = ax_spk.scatter([], [], s=8, c='#2c3e50', marker='|', alpha=0.8)
 
     ax_w = fig.add_subplot(gs[1, 1])
-    ax_w.set_title("STDP Receptive Fields", fontweight='bold')
+    ax_w.set_title("STDP Receptive Fields (64x128)", fontsize=10, fontweight='bold', pad=8)
     w_display = np.zeros((8, 8 * N_INPUT))
-    img_w = ax_w.imshow(w_display, cmap='RdBu_r', vmin=W_MIN, vmax=W_MAX, aspect='auto')
+    img_w = ax_w.imshow(w_display, cmap='coolwarm', vmin=W_MIN, vmax=W_MAX, aspect='auto')
     ax_w.axis('off')
 
     top_16_idx = np.argsort(results['spike_rate'])[::-1][:16]
@@ -327,8 +350,11 @@ def create_stdp_debug_gif(results, batch_idx=0, save_path="stdp_debug.gif", step
 
     frames = list(range(1, T, step_skip))
     anim = animation.FuncAnimation(fig, update, frames=frames, blit=False)
-    anim.save(save_path, writer='pillow', fps=15, dpi=72)
-    print(f" ✅ GIF saved successfully!")
+    
+    # Save with precise publication-ready low DPI for extremely lightweight size on Git
+    anim.save(save_path, writer='pillow', fps=15, dpi=55)
+    plt.close(fig)
+    print(f" ✅ GIF saved successfully to root workspace!")
 
 if __name__ == '__main__':
     print("=" * 65)
@@ -336,4 +362,4 @@ if __name__ == '__main__':
     print("=" * 65)
     events, tof_dists = generate_sandbox_moving_bar(n_samples=1, n_steps=300)
     results = evaluate_vision_stdp(random.PRNGKey(42), events, tof_dists, learn=True)
-    create_stdp_debug_gif(results, batch_idx=0, save_path="stdp_debug.gif", step_skip=2)
+    create_stdp_debug_gif(results, batch_idx=0, save_path=None, step_skip=2)

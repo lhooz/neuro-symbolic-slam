@@ -2,7 +2,7 @@
 
 | **Closed-Loop Spiking SLAM** | **Unsupervised STDP Feature Extraction** |
 | :---: | :---: |
-| <img src="src/snn_live_run.gif" width="375"> | <img src="stdp_debug.gif" width="375"> |
+| <img src="snn_live_run.gif" width="375"> | <img src="stdp_debug.gif" width="375"> |
 | *Real-time neuro-symbolic SLAM. Tracks 3-DOF robot coordinates using grid-cell spiking attractors (CANN) and closes loops via dynamic graph optimization.* | *Online unsupervised Spike-Timing-Dependent Plasticity (STDP) under active-dependent Synaptic Scaling, learning stable visual receptive fields directly from high-frequency event streams.* |
 
 **snn-slam** is a JAX-accelerated, biologically plausible **Neuro-Symbolic Spiking SLAM** system for neuromorphic robotics. It unifies high-frequency event-driven visual processing, spiking continuous attractor network dynamics, and Hebbian plasticity to track 3-DOF robot poses, construct topological spatial maps, and close loops with industrial-grade robustness.
@@ -27,8 +27,11 @@ snn-slam/                       <-- Repository Root
 │   ├── snn_vision_stdp.py      # Unsupervised STDP layer with active-dependent Synaptic Scaling
 │   ├── snn_vision_fusion.py    # Spatiotemporal fusion of polarized CSNN and STDP visual channels
 │   ├── snn_vision_csnn.py      # Fixed convolutional spiking neural network edge-extractor
-│   └── sparse_forest.py        # Differentiable virtual arena environment & virtual sensor rendering
-└── run_slam.py                 # Main entrypoint to execute closed-loop SLAM simulation
+│   ├── sparse_forest.py        # Differentiable virtual arena environment & virtual sensor rendering
+│   └── frozen_csnn_weights.msgpack # Pre-trained sensory CSNN weights (essential resources)
+├── run_slam.py                 # Main entrypoint to execute closed-loop SLAM simulation
+├── snn_live_run.gif            # 30-second live SLAM loop-closure animation highlight
+└── stdp_debug.gif              # Visual diagnostic animation showing unsupervised STDP learning
 ```
 
 ---
@@ -57,11 +60,15 @@ python run_slam.py
 
 ## 🎨 Under the Hood: Neuro-Symbolic Loop Gating
 
-When the robot moves, physical sensors drift. To solve this, your system calculates a **Surprise** signal by checking the overlap between the visual reality and the position-based place cell expectation:
+When the robot moves, physical sensors accumulate tracking errors. To resolve this, the system calculates a **Surprise** signal by checking the overlap between the visual reality (sensory input) and the position-based place cell expectation (CANN attractor belief):
 
 $$\text{Surprise} = 1.0 - \text{Raw}_{\text{Match}}$$
 
-When surprise exceeds the threshold ($\ge 0.30$), the loop closure engine initiates the multi-stage defense gate to align coordinates:
+This surprise signal controls two critical neuro-symbolic pathways:
+* **Loop Closure Activation ($\text{Surprise} \ge 0.30$):** Under moderate sensory mismatch, the loop closure engine is triggered to query past visual barcodes and execute multi-stage defense gates.
+* **Autopilot Learning Freeze ($\text{Surprise} \ge 0.60$):** Under extreme visual discrepancy, unsupervised STDP learning is frozen (autopilot off) to protect the pre-existing visual memory from catastrophic forgetting.
+
+When the loop closure engine is activated ($\ge 0.30$), it initiates the following multi-stage verification pipeline to align the graph:
 
 ```mermaid
 graph TD
