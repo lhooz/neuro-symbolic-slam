@@ -28,9 +28,7 @@ snn-slam/                       <-- Repository Root
 │   ├── snn_vision_fusion.py    # Spatiotemporal fusion of polarized CSNN and STDP visual channels
 │   ├── snn_vision_csnn.py      # Fixed convolutional spiking neural network edge-extractor
 │   └── sparse_forest.py        # Differentiable virtual arena environment & virtual sensor rendering
-├── run_slam.py                 # Main entrypoint to execute closed-loop SLAM simulation
-├── slam_gate_monitor.py        # Debug suite analyzing the loop closure gating pipeline activation
-└── slam_sweep.py               # Hyperparameter sweep coordinator analyzing loop-closure success rates
+└── run_slam.py                 # Main entrypoint to execute closed-loop SLAM simulation
 ```
 
 ---
@@ -55,19 +53,13 @@ To run the live SLAM system with the full 4-panel real-time visualization:
 python run_slam.py
 ```
 
-To run a diagnostic sweep or inspect individual gate behaviors across frames:
-
-```bash
-python slam_gate_monitor.py
-```
-
 ---
 
 ## 🎨 Under the Hood: Neuro-Symbolic Loop Gating
 
 When the robot moves, physical sensors drift. To solve this, your system calculates a **Surprise** signal by checking the overlap between the visual reality and the position-based place cell expectation:
 
-$$\text{Surprise} = 1.0 - \text{Raw\_Match}$$
+$$\text{Surprise} = 1.0 - \text{Raw}_{\text{Match}}$$
 
 When surprise exceeds the threshold ($\ge 0.30$), the loop closure engine initiates the multi-stage defense gate to align coordinates:
 
