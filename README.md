@@ -30,15 +30,14 @@ neuro-symbolic-slam/            <-- Repository Root
 │   ├── sparse_forest.py        # Differentiable virtual arena environment & virtual sensor rendering
 │   ├── train_vision_online.py  # Online unsupervised STDP vision training script
 │   └── frozen_csnn_weights.msgpack  # Pre-trained sensory CSNN weights (essential resource)
-├── scripts/                    <-- Diagnostic & Utility Scripts (not tracked in repo)
+├── scripts/                    <-- Diagnostic & Utility Scripts
 │   ├── run_slam.py             # Main entrypoint to execute closed-loop SLAM simulation
 │   ├── slam_gate_monitor.py    # Live loop-closure gate diagnostics
 │   ├── slam_sweep.py           # Hyperparameter sweep runner
 │   ├── slam_variance.py        # Variance analysis across runs
 │   └── stress_test.py          # System stress-test harness
-├── results/                    <-- Output Media & Data (not tracked in repo)
+├── results/                    <-- Output Media (GIFs tracked; bulk data files excluded)
 │   ├── snn_live_run.gif        # 30-second live SLAM loop-closure animation highlight
-│   ├── snn_slam_realtime.gif   # Full real-time SLAM session recording
 │   └── stdp_debug.gif          # Visual diagnostic animation showing unsupervised STDP learning
 └── PROJECT_SUMMARY.md          # Technical project summary
 ```
