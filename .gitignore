@@ -151,7 +151,4 @@ brain/
 *.png
 
 # Local diagnostic and sweep scripts
-slam_gate_monitor.py
-slam_sweep.py
-slam_variance.py
-stress_test.py
+scripts/

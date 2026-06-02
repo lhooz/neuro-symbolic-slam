@@ -1,0 +1,629 @@
+#!/usr/bin/env python3
+"""
+snn_vision_stdm.py — Adaptive Visual Frontend via Unsupervised STDP
+
+Split-Brain Architecture: The Twin's adaptive feature extractor.
+
+Key design decisions:
+  1. PURE unsupervised STDP — no Adam, no surrogate gradients, no backprop.
+     Learning is governed entirely by spike timing coincidence.
+  2. Lateral inhibition (WTA) — spatial competition so different neurons
+     learn different features (corners, edges, junctions).
+  3. Discrete-event STDP with eligibility traces — numerically stable online learning.
+  4. Two-compartment neurons: one for feedforward (STDP-learned), one for
+     lateral competition (inhibition).
+
+STDP Rule (pair-based, additive):
+  ΔW_ij = A⁺·exp(-Δt/τ⁺)·[W_max - W_ij]   if Δt > 0  (pre-before-post: LTP)
+  ΔW_ij = -A⁻·exp(Δt/τ⁻)·[W_ij - W_min]    if Δt < 0  (post-before-pre: LTD)
+
+Eligibility trace (soft approximation of continuous-time STDP):
+  e_pre[t] = exp(-DT/τ_e) · e_pre[t-1] + spike_pre[t]
+  e_post[t] = exp(-DT/τ_e) · e_post[t-1] + spike_post[t]
+  ΔW = η · (e_pre · spike_post - e_post · spike_pre)
+
+Author: Ada 🦊
+"""
+
+import jax
+import jax.numpy as jnp
+from jax import random
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import time
+
+import sys
+sys.path.insert(0, '/Users/lhooz/.openclaw/workspace')
+
+from src.sparse_forest import (
+    N_PIXELS, TIME_STEPS, DT,
+    FOV_DEG,
+)
+
+# ============================================================================
+# 1. STDP Hyperparameters
+# ============================================================================
+
+# Neuron counts
+N_INPUT = N_PIXELS          # event camera pixels (64 in sparse_forest)
+N_HIDDEN = 256              # STDP feature neurons (more than input = sparse coding)
+N_TOF_CHANNELS = 4          # ToF depth quantization bands
+
+# LIF parameters
+BETA_LIF = 0.85             # membrane potential leak
+V_TH_STDP = 1.0             # spike threshold
+
+# STDP timing windows (milliseconds — scaled to real-time seconds)
+DT_MS = DT * 1000           # 20ms per step
+TAU_STDP = 20.0             # STDP exponential time constant (ms)
+A_PLUS = 0.01               # LTP learning rate
+A_MINUS = 0.012             # LTD learning rate (slightly larger = sparse features)
+W_MAX = 0.15                # max synaptic weight
+W_MIN = 0.0                 # min synaptic weight
+W_INIT_MEAN = 0.05          # initial weight mean
+W_INIT_STD = 0.02           # initial weight std
+
+# Eligibility trace decay ( bridges DT gap for stable STDP )
+TAU_TRACE = 15.0            # trace time constant (ms), scaled to simulation units
+TRACE_DECAY = jnp.exp(-DT_MS / TAU_TRACE)
+
+# Lateral inhibition (WTA)
+K_WTA = 24                  # top-K winners per timestep (↑ from 8 → more neurons learn)
+
+# Homeostatic adaptive thresholds — prevents WTA collapse
+# Each spike increments a neuron's threshold slightly, fatiguing hyper-dominant neurons
+# V_th_eff[n] = V_TH_STDP + v_th_adapt[n]
+# After spike: v_th_adapt += THETA_INC
+# Per-step decay: v_th_adapt *= THETA_DECAY   (τ ~ 4s at DT=20ms)
+THETA_INC = 0.50              # threshold increase per spike (volts) — aggressive fatigue
+THETA_DECAY = 0.986          # per-step decay factor (~τ=1.4s, slow adaptation)
+THETA_MAX = 5.0              # hard cap: dictator neurons can push to 5.0V (5× baseline)
+
+# ToF fusion
+TOF_GAIN = 0.1              # how strongly ToF depth modulates feature neurons
+
+# Output: spiking feature vector dimension
+N_OUTPUT_FEATURES = N_HIDDEN
+
+
+# ============================================================================
+# 2. LIF Neuron with Lateral Inhibition
+# ============================================================================
+
+def lif_step(v, i_ext, beta=BETA_LIF, v_th=V_TH_STDP):
+    """Discrete LIF step.
+
+    v_new = β·v + (1-β)·v_th + i_ext
+    spike = max(v_new - v_th, 0)   (clipped to ≥ 0)
+    v_new = v_new - spike·v_th     (reset by subtraction)
+
+    v_th: (B, N) or scalar — per-neuron effective threshold
+          When batched (B, N), JAX broadcasts elementwise.
+
+    Returns: (v_new, spike) — both (B, N)
+    """
+    v_new = beta * v + (1 - beta) * v_th + i_ext
+    spike = jnp.clip(v_new - v_th, 0.0, v_th)
+    v_new = v_new - spike           # hard reset by subtraction
+    return v_new, spike
+
+
+def lateral_inhibition(spike, k=K_WTA):
+    """Hard k-Winners-Take-All (k-WTA) — exactly K neurons fire per batch element.
+
+    Uses jax.lax.top_k to select exactly top-K neurons per batch element,
+    then hard-assigns binary spikes (0 or 1). No ties — exact K winners.
+    Works for arbitrary B, N and any spike value distribution.
+
+    spike: (B, N) — pre-inhibition membrane potentials / spike readiness
+    Returns: (B, N) — hard binary spike mask (exactly K ones per batch element)
+    """
+    B, N = spike.shape
+
+    # top_k returns (values, indices) sorted descending — O(N log K)
+    _, topk_idx = jax.lax.top_k(spike, k)  # (B, K)
+
+    # Build (B, N) boolean mask: True = winner
+    row_idx = jnp.arange(B, dtype=jnp.int32)[:, None]  # (B, 1)
+    col_idx = topk_idx                                # (B, K)
+    winner_mask = jnp.zeros((B, N), dtype=jnp.bool_)
+    winner_mask = winner_mask.at[row_idx, col_idx].set(True)
+
+    return winner_mask.astype(jnp.float32)
+
+
+
+# ============================================================================
+# 3. STDP Weight Update (Eligibility Trace Formulation)
+# ============================================================================
+
+class STDPLayer:
+    """Unsupervised STDP learning layer.
+
+    Uses eligibility traces for stable online weight updates:
+      e_pre[t] = α·e_pre[t-1] + spike_pre[t]
+      e_post[t] = α·e_post[t-1] + spike_post[t]
+      ΔW = η·(e_pre·spike_post - γ·e_post·spike_pre)
+
+    Where γ = A_minus/A_plus balances potentiation vs depression.
+
+    This is mathematically equivalent to the classical pair-based STDP
+    but is numerically stable for discrete-time simulation.
+    """
+
+    def __init__(self, key, n_pre, n_post,
+                 eta=A_PLUS, gamma=A_MINUS / A_PLUS,
+                 w_min=W_MIN, w_max=W_MAX):
+        """Initialize STDP layer.
+
+        n_pre:  number of presynaptic neurons
+        n_post: number of postsynaptic neurons
+        eta:    learning rate (A_plus)
+        gamma:  depression/potentiation ratio (A_minus/A_plus)
+        """
+        self.n_pre = n_pre
+        self.n_post = n_post
+        self.eta = eta
+        self.gamma = gamma
+        self.w_min = w_min
+        self.w_max = w_max
+
+        # Synaptic weights: (n_post, n_pre)
+        # W[post, pre] = weight from pre-neuron to post-neuron
+        k1, k2 = random.split(key)
+        self.W = random.normal(k1, (n_post, n_pre), dtype=jnp.float32) * W_INIT_STD + W_INIT_MEAN
+        self.W = jnp.clip(self.W, w_min, w_max)
+
+        # Eligibility traces (exponential low-pass of spike history)
+        # e_pre: (n_pre,) — trace for presynaptic spikes
+        # e_post: (n_post,) — trace for postsynaptic spikes
+        self.e_pre = jnp.zeros(n_pre, dtype=jnp.float32)
+        self.e_post = jnp.zeros(n_post, dtype=jnp.float32)
+
+    def reset_traces(self):
+        """Reset eligibility traces (call at start of each episode)."""
+        self.e_pre = jnp.zeros(self.n_pre, dtype=jnp.float32)
+        self.e_post = jnp.zeros(self.n_post, dtype=jnp.float32)
+
+    def step(self, spike_pre, spike_post):
+        """One STDP update step (functional — no in-place mutation).
+
+        spike_pre:  (n_pre,) — presynaptic spikes this timestep
+        spike_post: (n_post,) — postsynaptic spikes this timestep
+
+        Updates traces and applies weight change.
+        Returns: (updated_W, updated_e_pre, updated_e_post)
+        """
+        # Eligibility trace update: exponential low-pass
+        e_pre_new = TRACE_DECAY * self.e_pre + spike_pre
+        e_post_new = TRACE_DECAY * self.e_post + spike_post
+
+        # STDP weight update (additive pair-based rule):
+        # ΔW = η·(e_pre·spike_post^T - γ·e_post·spike_pre^T)
+        dW = (self.eta * jnp.outer(spike_post, e_pre_new)
+              - self.eta * self.gamma * jnp.outer(e_post_new, spike_pre))
+
+        # Soft bounds (multiplicative STDP):
+        bound_factor = 1.0 - (self.W - self.w_min) / (self.w_max - self.w_min + 1e-8)
+        dW_pos = dW * jnp.clip(bound_factor, 0.05, 1.0)
+        dW_neg = dW * jnp.clip(1.0 - bound_factor, 0.05, 1.0)
+        dW = jnp.where(dW >= 0, dW_pos, dW_neg)
+
+        W_new = jnp.clip(self.W + dW, self.w_min, self.w_max)
+        return W_new, e_pre_new, e_post_new
+
+    def apply_batch(self, spike_pre_all, spike_post_all):
+        """Apply STDP updates over a batch of spike pairs simultaneously.
+
+        spike_pre_all:  (B, n_pre)
+        spike_post_all: (B, n_post)
+
+        Returns: updated W
+        """
+        # Vectorized batch STDP: compute all dW in one shot
+        e_pre_expanded = jnp.broadcast_to(self.e_pre[None, :], spike_pre_all.shape)  # (B, n_pre)
+        e_post_expanded = jnp.broadcast_to(self.e_post[None, :], spike_post_all.shape)  # (B, n_post)
+
+        # dW[b, post, pre] = η * (e_pre[b, pre] * spike_post[b, post] - γ * e_post[b, post] * spike_pre[b, pre])
+        dW_batch = (self.eta * jnp.einsum('bp,bo->bop', e_pre_expanded, spike_post_all)
+                     - self.eta * self.gamma * jnp.einsum('bo,bp->bop', e_post_expanded, spike_pre_all))
+
+        # Update traces
+        self.e_pre = TRACE_DECAY * self.e_pre + spike_pre_all.mean(axis=0)
+        self.e_post = TRACE_DECAY * self.e_post + spike_post_all.mean(axis=0)
+
+        # Average weight change over batch, apply bounds
+        dW = dW_batch.mean(axis=0)  # (n_post, n_pre)
+        bound_factor = 1.0 - (self.W - self.w_min) / (self.w_max - self.w_min + 1e-8)
+        dW_pos = dW * jnp.clip(bound_factor, 0.05, 1.0)
+        dW_neg = dW * jnp.clip(1.0 - bound_factor, 0.05, 1.0)
+        dW = jnp.where(dW >= 0, dW_pos, dW_neg)
+
+        self.W = jnp.clip(self.W + dW, self.w_min, self.w_max)
+        return self.W
+
+    def forward(self, spike_pre):
+        """Compute postsynaptic current from presynaptic spikes.
+
+        spike_pre: (n_pre,) — input spikes
+        Returns: (n_post,) — total synaptic current
+        """
+        return self.W @ spike_pre
+
+
+# ============================================================================
+# 4. Vision STDP Network (Full Frontend)
+# ============================================================================
+
+class VisionSTDP:
+    """Adaptive visual frontend with unsupervised STDP.
+
+    Architecture:
+      Event Camera → ON/OFF Polarize → Input layer
+      Input layer  → STDP Weights  → LIF Hidden (feature neurons)
+                                          ↓
+                                     Lateral Inhibition (k-WTA)
+                                          ↓
+                                     Spike Output (feature vector)
+                                          ↓
+      ToF depth    → Depth-modulated current injection
+
+    The STDP layer learns to extract recurring spatiotemporal features
+    (edges, corners, motion boundaries) from the event stream without
+    any supervision. The lateral inhibition ensures different neurons
+    specialize to different features.
+    """
+
+    def __init__(self, key,
+                 n_input=N_INPUT,
+                 n_hidden=N_HIDDEN,
+                 k_wta=K_WTA,
+                 tof_channels=N_TOF_CHANNELS):
+        """Initialize the Vision STDP frontend.
+
+        key: JAX RNG
+        n_input:  number of input pixels (polarized ON+OFF = 2*N_PIXELS)
+        n_hidden: number of STDP feature neurons
+        k_wta:    number of winners per timestep (sparsity)
+        """
+        self.n_input = n_input
+        self.n_hidden = n_hidden
+        self.k_wta = k_wta
+        self.tof_channels = tof_channels
+
+        # Polarized input layer (ON + OFF channels)
+        self.n_polarized = 2 * n_input
+
+        # STDP layer: input → feature neurons
+        k1, k2 = random.split(key)
+        self.stdp = STDPLayer(k1, self.n_polarized, n_hidden)
+
+        # Membrane potentials (for LIF dynamics)
+        self._v_hidden = None
+
+        # Lateral inhibition parameters
+
+        # Stats
+        self._spike_count = None
+
+    def reset(self, B):
+        """Reset all state for new batch.
+
+        B: batch size
+        """
+        self._v_hidden = jnp.zeros((B, self.n_hidden))
+        self._v_th_adapt = jnp.zeros((B, self.n_hidden))  # adaptive thresholds
+        self.stdp.reset_traces()
+        self._spike_count = jnp.zeros((B, self.n_hidden))
+
+    def polarize_events(self, ev_frame):
+        """Convert raw event counts to ON/OFF polarization.
+
+        ev_frame: (B, N_INPUT) — raw event counts per pixel
+        Returns: (B, 2*N_INPUT) — [ON_events, OFF_events] concatenated
+        """
+        on_spike = jnp.clip(ev_frame, 0.0, 1.0)
+        off_spike = jnp.clip(-ev_frame, 0.0, 1.0)
+        return jnp.concatenate([on_spike, off_spike], axis=1)
+
+    def tof_to_depth_band(self, tof_dist):
+        """Convert continuous ToF distance to depth-band activation.
+
+        tof_dist: (B,) — ToF reading in meters
+        Returns: (B, tof_channels) — soft one-hot depth band activation
+        """
+        # Quantize depth into bands (scalar per batch element)
+        depth_min = 0.2   # meters
+        depth_max = 8.0
+        band_width = (depth_max - depth_min) / self.tof_channels
+        band_idx_f = (tof_dist - depth_min) / band_width  # (B,)
+        band_idx = jnp.clip(jnp.floor(band_idx_f).astype(jnp.int32), 0, self.tof_channels - 1)
+
+        # Soft one-hot: Gaussian around the band center
+        # bands: (n_channels,) centers; band_idx: (B,)
+        sigma = 0.8  # softness
+        depth_activations = jnp.exp(
+            -((jnp.arange(self.tof_channels, dtype=jnp.float32)[None, :]
+               - band_idx[:, None])**2) / (2 * sigma**2)
+        )  # (B, tof_channels)
+        return depth_activations
+
+    def __call__(self, ev_frame, tof_dist, learn=True):
+        """One forward step of the Vision STDP frontend.
+
+        ev_frame:  (B, N_INPUT) — raw event frame
+        tof_dist:  (B,)          — ToF distance in meters
+        learn:     bool          — if True, apply STDP weight updates
+
+        Returns:
+          spike_out: (B, N_HIDDEN) — output feature spikes
+          features:  (B, N_HIDDEN) — average firing rate (readout)
+        """
+        B = ev_frame.shape[0]
+
+        # 1. Polarize events
+        ev_pol = self.polarize_events(ev_frame)  # (B, 2*N_INPUT)
+
+        # 2. Forward through STDP weights → synaptic current
+        i_syn = ev_pol @ self.stdp.W.T  # (B, N_HIDDEN) — functional forward (no vmap)
+
+        # 3. Depth-modulated gain (closer = stronger feature signal)
+        depth_band = self.tof_to_depth_band(tof_dist)  # (B, tof_channels)
+        depth_gain = depth_band[:, 0]  # (B,)
+        i_depth = TOF_GAIN * depth_gain[:, None] * i_syn.mean(axis=1, keepdims=True)
+        i_ext = i_syn + 0.1 * i_depth  # blend
+
+        # 4a. Homeostatic threshold decay (before LIF update this step)
+        # Non-firing neurons' thresholds decay toward 0
+        self._v_th_adapt = self._v_th_adapt * THETA_DECAY
+
+        # 4b. LIF update with adaptive per-neuron threshold
+        v_th_eff = V_TH_STDP + self._v_th_adapt  # (B, N_HIDDEN)
+        v_new, spike_raw = lif_step(self._v_hidden, i_ext, v_th=v_th_eff)
+        self._v_hidden = v_new
+
+        # 5. k-WTA lateral inhibition
+        k_mask = lateral_inhibition(spike_raw, self.k_wta)
+
+        # Apply k-WTA: only winners fire, others are suppressed
+        spike_out = k_mask  # (B, N_HIDDEN) — hard binary spikes
+
+        # 5c. Homeostatic threshold potentiation — winners fatigue
+        # After firing, their threshold increases by THETA_INC (capped at THETA_MAX)
+        self._v_th_adapt = jnp.clip(
+            self._v_th_adapt + THETA_INC * spike_out,
+            0.0, THETA_MAX
+        )
+
+        # 6. STDP weight update (batch eligibility trace rule)
+        if learn:
+            # apply_batch: updates self.W, self.e_pre, self.e_post in place
+            _ = self.stdp.apply_batch(ev_pol, spike_out)
+
+        # Track spike statistics
+        self._spike_count = self._spike_count + spike_out
+
+        # Average firing rate as "features" (for downstream CANNs)
+        features = self._spike_count / (1.0 + 1e-8)  # rate proxy
+
+        return spike_out, features
+
+    def get_weights(self):
+        """Return current STDP-learned weights."""
+        return self.W
+
+
+# ============================================================================
+# 5. Diagnostic Visualization
+# ============================================================================
+
+def plot_stdp_weights(net, title="STDP Learned Weights"):
+    """Visualize the STDP synaptic weight matrix.
+
+    net: VisionSTDP instance
+    Weights shape: (N_HIDDEN, 2*N_INPUT) = (256, 128)
+
+    Each row = one feature neuron's receptive field (ON + OFF channels).
+    """
+    W = np.array(net.stdp.W)  # (N_HIDDEN, 2*N_INPUT)
+
+    n_hidden, n_pol = W.shape
+    n_input = n_pol // 2
+    half_fov = np.radians(FOV_DEG) / 2
+    angles = -half_fov + (2 * half_fov) * np.arange(n_input) / (n_input - 1)
+
+    # Show first 64 feature neurons (2 rows × 4 cols of 8×8 blocks)
+    n_show = min(64, n_hidden)
+    n_cols = 8
+    n_rows = n_show // n_cols
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(14, 2 * n_rows))
+    axes = axes.flatten() if n_show > 1 else [axes]
+
+    for idx in range(n_show):
+        ax = axes[idx]
+        w_row = W[idx].reshape(2, n_input)  # (2, N_INPUT)
+        im = ax.imshow(w_row, cmap='RdBu_r', vmin=W.min(), vmax=W.max(),
+                       aspect='auto')
+        ax.set_xticks([])
+        ax.set_yticks([0, 1])
+        ax.set_yticklabels(['ON', 'OFF'], fontsize=5)
+        ax.set_title(f'N{idx}', fontsize=5)
+
+    fig.suptitle(f'{title}\n'
+                  f'Weight range: [{W.min():.3f}, {W.max():.3f}] | '
+                  f'Mean: {W.mean():.4f} | Active features: {(W.max(axis=1) > 0.05).sum()}/{n_hidden}',
+                  fontsize=10, fontweight='bold')
+    plt.tight_layout()
+    return fig
+
+
+def plot_spike_raster(spike_history, title="Spike Raster", max_neurons=64):
+    """Raster plot of spike output over time.
+
+    spike_history: (T, B, N_HIDDEN)
+    """
+    T, B, N = spike_history.shape
+    spike_history = np.array(spike_history)
+
+    fig, axes = plt.subplots(1, B, figsize=(14, 4))
+    if B == 1:
+        axes = [axes]
+    colors = plt.cm.viridis(jnp.linspace(0, 1, min(max_neurons, N)))
+
+    for b in range(B):
+        ax = axes[b]
+        for n in range(min(max_neurons, N)):
+            ts = np.where(spike_history[:, b, n] > 0.5)[0]
+            if len(ts) > 0:
+                ax.scatter(ts * DT, n * np.ones(len(ts)),
+                           c=[colors[n]], s=2, marker='|')
+        ax.set_xlim(0, T * DT)
+        ax.set_ylim(0, max_neurons)
+        ax.set_xlabel('Time (s)')
+        ax.set_ylabel('Neuron index')
+        ax.set_title(f'Batch {b} — Spike Raster')
+        ax.grid(alpha=0.2, axis='y')
+
+    fig.suptitle(title, fontsize=11, fontweight='bold')
+    plt.tight_layout()
+    return fig
+
+
+# ============================================================================
+# 6. Evaluation on sparse_forest data
+# ============================================================================
+
+def evaluate_vision_stdp(key, n_samples=8, n_steps=100, learn=True, stdp_verbose=True):
+    """Run Vision STDP on sparse_forest event data and report feature quality."""
+
+    from src.sparse_forest import generate_fixed_room_dataset
+
+    events, labels, tof_dists, positions, obstacles, _ = \
+        generate_fixed_room_dataset(key, n_samples)
+
+    ev = np.array(events)
+    tof = np.array(tof_dists)
+    T = min(n_steps, TIME_STEPS)
+
+    B = n_samples
+    net = VisionSTDP(random.PRNGKey(42), n_input=N_INPUT, n_hidden=N_HIDDEN)
+    net.reset(B)
+
+    # Spike history for raster
+    spike_history = np.zeros((T, B, N_HIDDEN))
+    feature_history = np.zeros((T, B, N_HIDDEN))
+    weight_history = []
+
+    print(f"\n  🦊 Vision STDP Evaluation (B={B}, T={T}, learn={learn})")
+    print(f"     Input: {N_INPUT} pixels → {N_HIDDEN} feature neurons")
+    print(f"     k-WTA: {K_WTA} winners/step | Homeostasis: Δθ={THETA_INC}, decay={THETA_DECAY}, max={THETA_MAX}")
+
+    for t in range(T):
+        ev_t = ev[:, t, :]
+        tof_t = tof[:, t]
+
+        spike, features = net(ev_t, tof_t, learn=learn)
+        spike_history[t] = np.array(spike)
+        feature_history[t] = np.array(features)
+
+        if t % 20 == 0:
+            weight_history.append(np.array(net.stdp.W))
+
+    # Feature statistics
+    spike_rate = spike_history.mean(axis=(0, 1))  # mean rate per neuron
+    active_neurons = (spike_rate > 0.01).sum()
+
+    print(f"\n  📊 Feature Statistics:")
+    print(f"     Active neurons (>1% rate): {active_neurons}/{N_HIDDEN} "
+          f"({100*active_neurons/N_HIDDEN:.0f}%)")
+    print(f"     Mean spike rate: {spike_rate.mean()*1000:.1f} spikes/s/neuron")
+    print(f"     Max spike rate:  {spike_rate.max()*1000:.1f} spikes/s")
+    print(f"     Weight range: [{float(net.stdp.W.min()):.4f}, {float(net.stdp.W.max()):.4f}]")
+    print(f"     Weight mean: {float(net.stdp.W.mean()):.4f}")
+
+    # STDP weight evolution
+    if stdp_verbose and len(weight_history) > 1:
+        W_first = weight_history[0]
+        W_last = weight_history[-1]
+        W_change = np.abs(W_last - W_first).mean()
+        print(f"     Mean |ΔW| over {T} steps: {W_change:.5f}")
+        print(f"     STDP is {'actively learning' if W_change > 1e-4 else 'saturated/quiescent'}")
+
+    return {
+        'spike_history': spike_history,
+        'feature_history': feature_history,
+        'spike_rate': spike_rate,
+        'active_neurons': active_neurons,
+        'W_final': np.array(net.stdp.W),
+        'net': net,
+    }
+
+
+# ============================================================================
+# 7. Main
+# ============================================================================
+
+if __name__ == '__main__':
+    print("=" * 65)
+    print("  🦊 Vision STDP — Adaptive Feature Extraction")
+    print("    Pure unsupervised STDP + Lateral Inhibition (k-WTA)")
+    print("=" * 65)
+
+    t0 = time.time()
+
+    # Build network
+    net = VisionSTDP(random.PRNGKey(42))
+    print(f"\n  Architecture:")
+    print(f"    Input: {net.n_polarized} ({N_INPUT} px × 2 polarities)")
+    print(f"    Hidden: {N_HIDDEN} STDP feature neurons")
+    print(f"    k-WTA: {K_WTA} winners")
+    print(f"    STDP: A⁺={A_PLUS}, A⁻={A_MINUS}, τ={TAU_STDP}ms")
+    print(f"    Weights: ({N_HIDDEN}, {net.n_polarized}) = {N_HIDDEN*net.n_polarized:,} synapses")
+
+    # Evaluate with learning
+    results = evaluate_vision_stdp(random.PRNGKey(99), n_samples=8, n_steps=100, learn=True)
+
+    # Visualizations
+    print(f"\n  Generating visualizations...")
+
+    # Weight matrix
+    fig_weights = plot_stdp_weights(results['net'],
+                                     title="Learned Feature Receptive Fields")
+    out_w = '/Users/lhooz/.openclaw/workspace/results/stdp_weights.png'
+    fig_weights.savefig(out_w, dpi=120, bbox_inches='tight', facecolor='white')
+    print(f"  📸 Saved: {out_w}")
+    plt.close(fig_weights)
+
+    # Spike raster
+    fig_raster = plot_spike_raster(results['spike_history'],
+                                    title="Feature Neuron Spike Raster",
+                                    max_neurons=64)
+    out_r = '/Users/lhooz/.openclaw/workspace/results/stdp_raster.png'
+    fig_raster.savefig(out_r, dpi=120, bbox_inches='tight', facecolor='white')
+    print(f"  📸 Saved: {out_r}")
+    plt.close(fig_raster)
+
+    # Feature firing rate histogram
+    fig, ax = plt.subplots(1, 1, figsize=(8, 4))
+    rates = results['spike_rate'] * 1000  # spikes/s
+    ax.hist(rates, bins=50, color='steelblue', alpha=0.7, edgecolor='white')
+    ax.set_xlabel('Mean Firing Rate (spikes/s)')
+    ax.set_ylabel('Number of neurons')
+    ax.set_title(f'STDP Feature Firing Rate Distribution\n'
+                  f'Active: {results["active_neurons"]}/{N_HIDDEN} neurons, '
+                  f'Mean: {rates.mean():.1f} spk/s')
+    ax.grid(alpha=0.2)
+    plt.tight_layout()
+    out_h = '/Users/lhooz/.openclaw/workspace/results/stdp_rate_hist.png'
+    fig.savefig(out_h, dpi=120, bbox_inches='tight', facecolor='white')
+    print(f"  📸 Saved: {out_h}")
+    plt.close(fig)
+
+    total_time = time.time() - t0
+    print(f"\n  ✅ Vision STDP done in {total_time:.1f}s")
+    print(f"  📸 Weight matrix: results/stdp_weights.png")
+    print(f"  📸 Spike raster:  results/stdp_raster.png")
+    print(f"  📸 Rate histogram: results/stdp_rate_hist.png")

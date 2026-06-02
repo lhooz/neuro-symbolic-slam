@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+"""
+slam_env.py — SLAM Environment Wrapper
+
+Thin wrapper around sparse_forest.py with SLAM-specific helpers:
+  - OccupancyGrid: Classical 2D probabilistic occupancy grid
+  - FrontierExplorer: Active exploration policy for mapping
+  - ToF + bearing → obstacle projection utilities
+
+Author: Ada 🦊
+"""
+
+import sys
+sys.path.insert(0, '/Users/lhooz/.openclaw/workspace')
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from functools import partial
+
+from src.sparse_forest import (
+    generate_fixed_room_dataset,
+    cast_rays,
+    ROOM_W, ROOM_H, DT, TIME_STEPS,
+    N_PIXELS, FOV_DEG, N_OBSTACLES,
+)
+
+
+# ============================================================================
+# Occupancy Grid Map
+# ============================================================================
+
+class OccupancyGrid:
+    """2D probabilistic occupancy grid map.
+
+    Uses log-odds representation for efficient updates.
+    """
+
+    def __init__(self, resolution=0.2, size_x=ROOM_W, size_y=ROOM_H):
+        """
+        resolution: meters per cell
+        size_x, size_y: room dimensions in meters
+        """
+        self.resolution = resolution
+        self.n_cells_x = int(np.ceil(size_x / resolution))
+        self.n_cells_y = int(np.ceil(size_y / resolution))
+        self.grid = np.zeros((self.n_cells_x, self.n_cells_y), dtype=np.float32)
+        # log-odds: 0 = unknown, positive = occupied, negative = free
+
+    def world_to_grid(self, wx, wy):
+        """Convert world coords (meters) to grid cell indices."""
+        gx = int(np.clip(wx / self.resolution, 0, self.n_cells_x - 1))
+        gy = int(np.clip(wy / self.resolution, 0, self.n_cells_y - 1))
+        return gx, gy
+
+    def grid_to_world(self, gx, gy):
+        """Convert grid cell indices to world coords (cell center)."""
+        wx = (gx + 0.5) * self.resolution
+        wy = (gy + 0.5) * self.resolution
+        return wx, wy
+
+    def update(self, pose, bearing, tof_dist, log_odds_occ=0.9, log_odds_free=-0.4):
+        """Update grid with a single observation.
+
+        pose: (x, y, theta) in world frame
+        bearing: float — relative angle from robot to obstacle (radians)
+        tof_dist: float — distance to obstacle (meters)
+        """
+        x, y, theta = pose
+        world_angle = theta + bearing
+        obs_x = x + tof_dist * np.cos(world_angle)
+        obs_y = y + tof_dist * np.sin(world_angle)
+
+        # Mark obstacle cell as occupied
+        gx, gy = self.world_to_grid(obs_x, obs_y)
+        self.grid[gx, gy] = np.clip(self.grid[gx, gy] + log_odds_occ, -5, 5)
+
+        # Mark cells along the ray as free
+        n_steps = int(tof_dist / self.resolution)
+        for i in range(n_steps):
+            fx = x + (i / max(n_steps, 1)) * (obs_x - x)
+            fy = y + (i / max(n_steps, 1)) * (obs_y - y)
+            fgx, fgy = self.world_to_grid(fx, fy)
+            self.grid[fgx, fgy] = np.clip(self.grid[fgx, fgy] + log_odds_free, -5, 5)
+
+    def get_probability(self):
+        """Convert log-odds to probability [0, 1]."""
+        return 1.0 / (1.0 + np.exp(-self.grid))
+
+    def get_binary(self, threshold=0.5):
+        """Get binary occupancy (1=occupied, 0=free/unknown)."""
+        return (self.get_probability() > threshold).astype(np.float32)
+
+    def plot(self, ax, cmap='Greys', alpha=0.7):
+        """Plot the grid on a matplotlib axis."""
+        prob = self.get_probability()
+        ax.imshow(prob.T, origin='lower',
+                 extent=[0, self.n_cells_x * self.resolution,
+                         0, self.n_cells_y * self.resolution],
+                 cmap=cmap, alpha=alpha, vmin=0, vmax=1)
+
+
+# ============================================================================
+# Frontier Exploration
+# ============================================================================
+
+class FrontierExplorer:
+    """Active exploration: navigate toward unmapped areas (frontiers)."""
+
+    def __init__(self, grid: OccupancyGrid):
+        self.grid = grid
+
+    def find_frontiers(self, pose, min_frontier_size=3):
+        """Find frontier cells (unknown cells adjacent to free cells).
+
+        Returns list of (gx, gy) frontier cell centers in world coords.
+        """
+        prob = self.grid.get_probability()
+
+        # Unknown cells: probability near 0.5
+        unknown = (prob > 0.35) & (prob < 0.65)
+
+        # Free cells
+        free = prob < 0.35
+
+        # A frontier cell is unknown with at least one free neighbor
+        frontiers = []
+        for gx in range(1, self.grid.n_cells_x - 1):
+            for gy in range(1, self.grid.n_cells_y - 1):
+                if unknown[gx, gy]:
+                    # Check 4-neighborhood for free cells
+                    neighbors = [free[gx-1, gy], free[gx+1, gy],
+                                free[gx, gy-1], free[gx, gy+1]]
+                    if any(neighbors):
+                        wx, wy = self.grid.grid_to_world(gx, gy)
+                        frontiers.append((wx, wy))
+
+        return frontiers
+
+    def get_goal(self, pose, min_dist=1.0):
+        """Get next exploration goal — nearest frontier.
+
+        pose: (x, y, theta)
+        Returns: (goal_x, goal_y) or None if no frontiers found
+        """
+        frontiers = self.find_frontiers(pose)
+        if not frontiers:
+            return None
+
+        x, y, _ = pose
+        # Sort by distance, filter too-close frontiers
+        dists = [np.sqrt((fx - x)**2 + (fy - y)**2) for fx, fy in frontiers]
+        candidates = [(d, fx, fy) for d, fx, fy in zip(dists, [f[0] for f in frontiers], [f[1] for f in frontiers])
+                     if d >= min_dist]
+
+        if not candidates:
+            return None
+
+        # Nearest frontier
+        candidates.sort()
+        _, gx, gy = candidates[0]
+        return gx, gy
+
+    def navigate_to_goal(self, pose, goal, speed=0.3):
+        """Compute velocity command to navigate toward goal.
+
+        pose: (x, y, theta)
+        goal: (goal_x, goal_y)
+        Returns: (vx, vy, omega) velocity command
+        """
+        if goal is None:
+            return 0.0, 0.0, 0.0
+
+        gx, gy = goal
+        x, y, theta = pose
+
+        dx = gx - x
+        dy = gy - y
+        dist = np.sqrt(dx**2 + dy**2)
+
+        if dist < 0.2:  # reached goal
+            return 0.0, 0.0, 0.0
+
+        # Desired heading
+        desired_angle = np.arctan2(dy, dx)
+        angle_diff = desired_angle - theta
+        angle_diff = angle_diff % (2 * np.pi)
+        if angle_diff > np.pi:
+            angle_diff -= 2 * np.pi
+
+        # Simple proportional controller
+        omega = np.clip(angle_diff * 2.0, -0.5, 0.5)
+
+        # Move forward if roughly facing goal
+        if abs(angle_diff) < np.pi / 4:
+            vx = speed
+        else:
+            vx = 0.0
+
+        return vx, 0.0, omega
+
+
+# ============================================================================
+# SLAM Environment Helpers
+# ============================================================================
+
+def bearing_from_events(events_frame):
+    """Extract bearing (relative angle) to nearest obstacle from event frame.
+
+    events_frame: (N_PIXELS,) ON/OFF polarized
+    Returns: float — bearing in radians (relative to heading)
+    """
+    pixels = np.arange(N_PIXELS, dtype=np.float32)
+    half_fov = np.radians(FOV_DEG) / 2
+    angles = -half_fov + (2 * half_fov) * pixels / (N_PIXELS - 1)
+
+    event_sum = events_frame.sum()
+    if abs(event_sum) < 1e-6:
+        return 0.0  # no events → assume forward
+
+    weighted_angle = (events_frame * angles).sum()
+    bearing = weighted_angle / event_sum
+    return np.arctan(bearing)  # in [-π/2, π/2]
+
+
+def project_obstacle(pose, events_frame, tof_dist):
+    """Project obstacle into world coordinates.
+
+    pose: (x, y, theta)
+    events_frame: (N_PIXELS,)
+    tof_dist: float — meters
+
+    Returns: (obs_x, obs_y) in world coords
+    """
+    x, y, theta = pose
+    bearing = bearing_from_events(events_frame)
+    world_angle = theta + bearing
+    obs_x = x + tof_dist * np.cos(world_angle)
+    obs_y = y + tof_dist * np.sin(world_angle)
+    return obs_x, obs_y
+
+
+# ============================================================================
+# Demo
+# ============================================================================
+
+if __name__ == '__main__':
+    print("=" * 50)
+    print("  🦊 SLAM Environment — Occupancy Grid Demo")
+    print("=" * 50)
+
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+
+    # Generate one trajectory
+    key = jax.random.PRNGKey(42)
+    events, labels, tof_dists, positions, obstacles, *_, intensities = \
+        generate_fixed_room_dataset(key, 1)
+
+    events = np.array(events[0])   # (T, 64)
+    tof = np.array(tof_dists[0])   # (T,)
+    pos = np.array(positions[0])    # (T, 2)
+
+    # Integrate heading
+    T = TIME_STEPS
+    omega_abs = float(labels[0, 2]) * 0.5
+    theta = np.cumsum(np.full(T, omega_abs * DT))
+    theta = np.concatenate([[0], theta[:-1]])
+
+    # Build occupancy grid
+    grid = OccupancyGrid(resolution=0.2)
+
+    for t in range(0, T, 5):  # update every 5 steps
+        pose = (float(pos[t, 0]), float(pos[t, 1]), float(theta[t]))
+        bearing = bearing_from_events(events[t])
+        tof_m = float(tof[t]) * 8.0
+        if tof_m > 0.5:  # valid reading
+            grid.update(pose, bearing, tof_m)
+
+    # Plot
+    fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+    ax.set_aspect('equal')
+    ax.set_xlim(-0.5, ROOM_W + 0.5)
+    ax.set_ylim(-0.5, ROOM_H + 0.5)
+
+    # Room
+    ax.add_patch(Rectangle((0, 0), ROOM_W, ROOM_H,
+                          linewidth=2, edgecolor='#333',
+                          facecolor='#f5f5f0', alpha=0.4))
+
+    # Ground truth obstacles
+    for o in np.array(obstacles):
+        w, h = float(o[2]-o[0]), float(o[3]-o[1])
+        ax.add_patch(Rectangle((float(o[0]), float(o[1])), w, h,
+                               facecolor='#e74c3c', edgecolor='#222',
+                               linewidth=1.5, alpha=0.6,
+                               linestyle='--', label='GT obstacles'))
+
+    # Trajectory
+    ax.plot(pos[:, 0], pos[:, 1], '-b', alpha=0.5, lw=1.5, label='GT trajectory')
+
+    # Occupancy grid
+    grid.plot(ax, cmap='Greens', alpha=0.6)
+
+    ax.set_title('Occupancy Grid Map Built from SNN SLAM Estimates\n'
+                 '(Green = obstacles, Gray = free, White = unknown)')
+    ax.legend(loc='upper right')
+    ax.set_xlabel('x (m)')
+    ax.set_ylabel('y (m)')
+
+    out = '/Users/lhooz/.openclaw/workspace/results/slam_occupancy_grid.png'
+    fig.savefig(out, dpi=150, bbox_inches='tight')
+    print(f'\n📸 Saved occupancy grid: {out}')
+    plt.close(fig)
+
+    print("\n  ✅ slam_env.py ready!")
+    print("  Classes: OccupancyGrid, FrontierExplorer")
+    print("  Helpers: bearing_from_events, project_obstacle")

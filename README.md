@@ -1,11 +1,11 @@
-# snn-slam: Split-Brain Neuro-Symbolic Spiking SLAM
+# neuro-symbolic-slam: Split-Brain Neuro-Symbolic Spiking SLAM
 
 | **Closed-Loop Spiking SLAM** | **Unsupervised STDP Feature Extraction** |
 | :---: | :---: |
 | <img src="snn_live_run.gif" width="375"> | <img src="stdp_debug.gif" width="375"> |
 | *Real-time neuro-symbolic SLAM. Tracks 3-DOF robot coordinates using grid-cell spiking attractors (CANN) and closes loops via dynamic graph optimization.* | *Online unsupervised Spike-Timing-Dependent Plasticity (STDP) under active-dependent Synaptic Scaling, learning stable visual receptive fields directly from high-frequency event streams.* |
 
-**snn-slam** is a JAX-accelerated, biologically plausible **Neuro-Symbolic Spiking SLAM** system for neuromorphic robotics. It unifies high-frequency event-driven visual processing, spiking continuous attractor network dynamics, and Hebbian plasticity to track 3-DOF robot poses, construct topological spatial maps, and close loops with industrial-grade robustness.
+**neuro-symbolic-slam** is a JAX-accelerated, biologically plausible **Neuro-Symbolic Spiking SLAM** system for neuromorphic robotics. It unifies high-frequency event-driven visual processing, spiking continuous attractor network dynamics, and Hebbian plasticity to track 3-DOF robot poses, construct topological spatial maps, and close loops with industrial-grade robustness.
 
 Key features include:
 * **Split-Brain Vision Frontend:** Combines a fixed convolutional spiking neural network (CSNN) for instant edge-extraction with a plastic, self-organizing STDP frontend that learns custom receptive fields on event time-surfaces.
