@@ -152,3 +152,8 @@ brain/
 
 # Local diagnostic and sweep scripts
 scripts/
+
+# Local-only data folders (not tracked in repo)
+archives/
+params/
+results/

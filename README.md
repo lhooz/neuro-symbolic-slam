@@ -2,7 +2,7 @@
 
 | **Closed-Loop Spiking SLAM** | **Unsupervised STDP Feature Extraction** |
 | :---: | :---: |
-| <img src="snn_live_run.gif" width="375"> | <img src="stdp_debug.gif" width="375"> |
+| <img src="results/snn_live_run.gif" width="375"> | <img src="results/stdp_debug.gif" width="375"> |
 | *Real-time neuro-symbolic SLAM. Tracks 3-DOF robot coordinates using grid-cell spiking attractors (CANN) and closes loops via dynamic graph optimization.* | *Online unsupervised Spike-Timing-Dependent Plasticity (STDP) under active-dependent Synaptic Scaling, learning stable visual receptive fields directly from high-frequency event streams.* |
 
 **neuro-symbolic-slam** is a JAX-accelerated, biologically plausible **Neuro-Symbolic Spiking SLAM** system for neuromorphic robotics. It unifies high-frequency event-driven visual processing, spiking continuous attractor network dynamics, and Hebbian plasticity to track 3-DOF robot poses, construct topological spatial maps, and close loops with industrial-grade robustness.
@@ -18,20 +18,29 @@ Key features include:
 ### 📂 Project Structure
 
 ```text
-snn-slam/                       <-- Repository Root
+neuro-symbolic-slam/            <-- Repository Root
 ├── src/                        <-- Core Neural Components
-│   ├── snn_live_slam.py        # Live SLAM loop coordinator & loop-closure gating pipeline
 │   ├── snn_slam_system.py      # Split-Brain system orchestrator (Perception/Inference/Odo/Mapping)
+│   ├── snn_live_slam.py        # Live SLAM loop coordinator & loop-closure gating pipeline
 │   ├── snn_place_cells.py      # Place cell mapping, Hebbian memory bank & surprise computation
 │   ├── snn_pose_cann.py        # 2D grid-cell and 1D head-direction ring attractor networks
 │   ├── snn_vision_stdp.py      # Unsupervised STDP layer with active-dependent Synaptic Scaling
 │   ├── snn_vision_fusion.py    # Spatiotemporal fusion of polarized CSNN and STDP visual channels
 │   ├── snn_vision_csnn.py      # Fixed convolutional spiking neural network edge-extractor
 │   ├── sparse_forest.py        # Differentiable virtual arena environment & virtual sensor rendering
-│   └── frozen_csnn_weights.msgpack # Pre-trained sensory CSNN weights (essential resources)
-├── run_slam.py                 # Main entrypoint to execute closed-loop SLAM simulation
-├── snn_live_run.gif            # 30-second live SLAM loop-closure animation highlight
-└── stdp_debug.gif              # Visual diagnostic animation showing unsupervised STDP learning
+│   ├── train_vision_online.py  # Online unsupervised STDP vision training script
+│   └── frozen_csnn_weights.msgpack  # Pre-trained sensory CSNN weights (essential resource)
+├── scripts/                    <-- Diagnostic & Utility Scripts (not tracked in repo)
+│   ├── run_slam.py             # Main entrypoint to execute closed-loop SLAM simulation
+│   ├── slam_gate_monitor.py    # Live loop-closure gate diagnostics
+│   ├── slam_sweep.py           # Hyperparameter sweep runner
+│   ├── slam_variance.py        # Variance analysis across runs
+│   └── stress_test.py          # System stress-test harness
+├── results/                    <-- Output Media & Data (not tracked in repo)
+│   ├── snn_live_run.gif        # 30-second live SLAM loop-closure animation highlight
+│   ├── snn_slam_realtime.gif   # Full real-time SLAM session recording
+│   └── stdp_debug.gif          # Visual diagnostic animation showing unsupervised STDP learning
+└── PROJECT_SUMMARY.md          # Technical project summary
 ```
 
 ---
@@ -42,8 +51,8 @@ snn-slam/                       <-- Repository Root
 Ensure you have Python 3.10+ installed. Clone the repository and install the dependencies:
 
 ```bash
-git clone https://github.com/lhooz/snn-slam.git
-cd snn-slam
+git clone https://github.com/lhooz/neuro-symbolic-slam.git
+cd neuro-symbolic-slam
 pip install -r requirements.txt
 ```
 
@@ -53,7 +62,7 @@ pip install -r requirements.txt
 To run the live SLAM system with the full 4-panel real-time visualization:
 
 ```bash
-python run_slam.py
+python scripts/run_slam.py
 ```
 
 ---
