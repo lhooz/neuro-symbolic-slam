@@ -147,10 +147,17 @@ memory/heartbeat-state.json
 brain/
 *.msgpack
 *.json
+
+# Ignore generated images/animations everywhere EXCEPT results/ visualisations
 *.gif
 *.png
+!results/*.gif
+!results/*.png
 
 # Local-only data folders (not tracked in repo)
 archives/
 params/
-results/
+# Track results/ but ignore bulk data inside it
+results/**
+!results/*.gif
+!results/*.png
