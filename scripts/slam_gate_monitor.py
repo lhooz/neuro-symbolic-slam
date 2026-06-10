@@ -4,9 +4,9 @@ slam_gate_monitor.py — Monitor SNN SLAM gate statistics over a long run.
 Records all 7 gates + maturity + concentrations at each step for post-hoc analysis.
 """
 import sys, os, time, json
-ROOT = '/Users/lhooz/.openclaw/workspace'
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-sys.path.insert(0, os.path.join(ROOT, 'src/stable1'))
+sys.path.insert(0, os.path.join(ROOT, 'src'))
 os.environ['MPLBACKEND'] = 'Agg'
 os.environ['CUDA_VISIBLE_DEVICES'] = ''
 
@@ -15,7 +15,7 @@ import jax.numpy as jnp
 from jax import random
 import numpy as np
 
-import src.stable1.snn_slam_system as S
+import src.snn_slam_system as S
 
 
 def run_monitored_trial(seed: int, n_steps: int = 10000,
@@ -33,8 +33,8 @@ def run_monitored_trial(seed: int, n_steps: int = 10000,
     system_ol.reset(1); system_cl.reset(1)
 
     _, _, _, pos0, th0, _ = env.step()
-    system_ol.initialize_from_gt(jnp.array([pos0]), jnp.array([th0]))
-    system_cl.initialize_from_gt(jnp.array([pos0]), jnp.array([th0]))
+    system_ol.initialize_pose(jnp.array([pos0]), jnp.array([th0]))
+    system_cl.initialize_pose(jnp.array([pos0]), jnp.array([th0]))
 
     # Gate histories (sampled every `record_every` steps)
     gate_keys = [

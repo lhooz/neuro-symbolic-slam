@@ -13,8 +13,8 @@ import time
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-ROOM_W = 10.0
-ROOM_H = 10.0
+ROOM_W = 2.0
+ROOM_H = 2.0
 
 N_PIXELS = 256
 FOV_DEG = 90.0
@@ -26,15 +26,15 @@ BARCODE_RESOLUTION = 512
 THRESHOLD = 0.015
 
 N_OBSTACLES = 15
-OBS_SIZE_MIN = 0.1
-OBS_SIZE_MAX = 0.7
-OBS_MARGIN = 2.0         
+OBS_SIZE_MIN = 0.02        # 2cm twig (×0.2 from 10m-room scale)
+OBS_SIZE_MAX = 0.14        # 14cm stem (×0.2 from 10m-room scale)
+OBS_MARGIN = 0.4           # 40cm wall buffer (×0.2)
 
-VX_RANGE = (-0.8, 0.8)
-VY_RANGE = (-0.3, 0.3)
+VX_RANGE = (-0.5, 0.5)     # physical hornet forward speed cap
+VY_RANGE = (-0.15, 0.15)   # physical lateral speed cap
 OMEGA_RANGE = (-1.0, 1.0)
 
-SAFE_MARGIN = 0.5        
+SAFE_MARGIN = 0.1          # 10cm spawn clearance (×0.2)
 MAX_ROOM_ATTEMPTS = 100  
 MAX_TRAJ_ATTEMPTS = 50   
 
@@ -115,7 +115,7 @@ def _make_trajectory(key, time_steps, dt, obstacles=None):
     vy = np.zeros(time_steps, dtype=np.float32)
     omega = np.zeros(time_steps, dtype=np.float32)
     
-    margin = SAFE_MARGIN + 0.3
+    margin = SAFE_MARGIN + 0.05
     obs_np = np.array(obstacles) if obstacles is not None else np.zeros((0, 4))
     
     spawn_attempts = 0
@@ -136,7 +136,7 @@ def _make_trajectory(key, time_steps, dt, obstacles=None):
         return None 
 
     hdg[0] = rng.uniform(0, 2 * np.pi)
-    v_forward = 0.6  
+    v_forward = 0.3   # reduced for 2m room (was 0.6 in 10m room)
     current_omega = rng.uniform(-0.5, 0.5)
     
     for t in range(1, time_steps):
@@ -260,7 +260,7 @@ def compute_tof_distance(robot_pos, robot_heading, segments):
     dists, _ = cast_rays(origins, directions, segments) 
     min_dists = jnp.min(dists, axis=-1) 
 
-    max_range = 8.0
+    max_range = 2.83  # max diagonal of 2m×2m room = √(2²+2²)
     tof_dists = jnp.clip(min_dists, 0.0, max_range)
 
     return tof_dists
@@ -333,7 +333,7 @@ def _sample_barcode_fast(min_idx, nearest, min_dist, obstacles, tex_tensor):
     batch_idx = jnp.arange(n_pix) 
     intensity = tex_for_pix[batch_idx, tex_idx]
 
-    t_depth = min_dist / 14.14  
+    t_depth = min_dist / 2.83   # normalise by room diagonal (was 14.14=√(10²+10²); now 2.83=√(2²+2²))
     
     for freq, amp in zip(TEX_FREQS, TEX_AMPS):
         phase = jnp.pi * freq 
@@ -423,7 +423,7 @@ def generate_sample(key, time_steps=TIME_STEPS, dt=DT):
                     vy_arr = vy.astype(jnp.float32)
                     omega_arr = omega.astype(jnp.float32)
 
-                clearance_norm = jnp.tanh(min_clear_arr / 2.0)          
+                clearance_norm = jnp.tanh(min_clear_arr / 0.4)          # 2m room: half of 0.8m mid-room clearance (was /2.0 in 10m room)
                 labels = jnp.stack([
                     vx_arr     / abs(VX_RANGE[1]),
                     vy_arr     / abs(VY_RANGE[1]),
@@ -594,6 +594,46 @@ def generate_fixed_room_dataset(key, n_samples, obstacles=None, time_steps=TIME_
             tof_list.append(tof_dists)
             positions_list.append(positions)
             headings_list.append(headings)
+
+    if len(events_list) == 0:
+        # Fallback: ignore traj_ok (allow bounces) if we can't find a perfectly clear trajectory
+        for attempt in range(max_attempts):
+            k_traj = jax.random.PRNGKey(rng.randint(0, 2**31))
+            traj_result = _make_trajectory(k_traj, time_steps, dt, obstacles)
+            if traj_result is None: continue
+            positions, headings, vx, vy, omega = traj_result
+            spawn_ok = bool(jnp.all(_is_clear(positions[0, 0], positions[0, 1], obstacles)))
+            if spawn_ok or attempt == max_attempts - 1:
+                readings = jax.vmap(
+                    lambda p, h: compute_pixel_readings(
+                        p, h, segments, surface_textures, jax_obstacles, tex_t
+                    )
+                )(positions, headings)
+                intensities = readings[0]
+                distances = readings[1]
+                intensities_list.append(intensities)
+                tof_dists = jax.vmap(compute_tof_distance, in_axes=(0, 0, None))(positions, headings, segments)
+                prev = jnp.concatenate([intensities[:1], intensities[:-1]], axis=0)
+                delta = intensities - prev
+                events = jnp.where(delta > THRESHOLD, 1.0, jnp.where(delta < -THRESHOLD, -1.0, 0.0))
+                events = events.at[0].set(0.0)
+                min_clear_arr = jnp.min(distances, axis=1)
+                vx_arr = vx.astype(jnp.float32)
+                vy_arr = vy.astype(jnp.float32)
+                omega_arr = omega.astype(jnp.float32)
+                clearance_norm = jnp.tanh(min_clear_arr / 2.0)
+                labels = jnp.stack([
+                    vx_arr     / abs(VX_RANGE[1]),
+                    vy_arr     / abs(VY_RANGE[1]),
+                    omega_arr  / abs(OMEGA_RANGE[1]),
+                    clearance_norm,
+                ], axis=1)
+                events_list.append(events)
+                labels_list.append(labels)
+                tof_list.append(tof_dists)
+                positions_list.append(positions)
+                headings_list.append(headings)
+                break
 
     return (jnp.stack(events_list), jnp.stack(labels_list), jnp.stack(tof_list),
             jnp.stack(positions_list), jnp.stack(headings_list), obstacles, segments,

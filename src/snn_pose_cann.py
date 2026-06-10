@@ -48,7 +48,7 @@ from src.sparse_forest import (
 
 # Multi-Module Grid Cells (2D spatial sheets)
 CANN_SIZES = [11, 13, 17]        # Neurons per edge for Module 1, 2, 3
-WRAP_SCALES = [3.0, 4.0, 5.3]    # Physical meters before wrapping
+WRAP_SCALES = [0.6, 0.8, 1.06]   # ×0.2 from 10m-room [3.0,4.0,5.3]; same WRAP/ROOM_W ratio
 TOTAL_GRID_DIM = sum([s**2 for s in CANN_SIZES]) # 121 + 169 + 289 = 579 neurons
 
 A_EXC = 0.5             
@@ -69,9 +69,17 @@ RING_TAU_U = 0.03
 BETA_LIF = 0.85
 V_TH = 1.0
 
-# Velocity injection gains (calibrated from snn_slam_twin.py)
-VEL_GAIN_XY = 0.10      # velocity → bump shift — restore original
-VEL_GAIN_TH = 0.19      # omega → ring shift — restore original
+# Velocity injection gains
+# VEL_GAIN_XY must be scaled with WRAP_SCALES: density_factor = c_size/scale.
+# Old 10m room: WRAP_SCALES[0]=3.0, slam_scale=10.0 → density_factor=3.67, V_map_x is 10x larger.
+# New  2m room: WRAP_SCALES[0]=0.6, slam_scale=1.0  → density_factor=18.3, V_map_x is 10x smaller.
+# The product (V_map_x * density_factor) is actually 2x smaller than before.
+# Therefore, we need to INCREASE the gain (0.10 → 0.15) and allow it to learn higher.
+VEL_GAIN_XY = 0.035     # velocity → bump shift (1:1 bump speed matching)
+VEL_GAIN_TH = 0.035     # omega → ring shift (lower gain to 0.035 to prevent overshoot)
+
+
+
 
 # ============================================================================
 # 1. Analytical DoG Weight Matrices
@@ -223,9 +231,11 @@ class VelocityPopulationCoder:
         self.sigma = sigma
 
     def __call__(self, v_mag):
-        diff = v_mag[:, None] - self.centers[None, :]
+        v_mag_clamped = jnp.clip(v_mag, self.centers[0], self.centers[-1])
+        diff = v_mag_clamped[:, None] - self.centers[None, :]
         activations = jnp.exp(-(diff ** 2) / (2 * self.sigma ** 2))
         return activations / (activations.sum(axis=1, keepdims=True) + 1e-8)
+
 
 # ============================================================================
 # 5. Pose CANN Class
@@ -247,9 +257,10 @@ class PoseCANN:
         
         self._u_ring = None
         self._r_ring = None
+        self._smooth_omega = None
         
         self.n_speed_neurons = 32
-        self.vel_coder_xy = VelocityPopulationCoder(self.n_speed_neurons, 0.0, 1.5, 0.1)
+        self.vel_coder_xy = VelocityPopulationCoder(self.n_speed_neurons, 0.0, 3.0, 0.2)
         self.vel_coder_th = VelocityPopulationCoder(self.n_speed_neurons, 0.0, 3.14, 0.2)
         
         self.prev_pose_xy = None
@@ -257,6 +268,11 @@ class PoseCANN:
 
     def reset(self, B):
         """Reset to centered Gaussian bumps (fallback initialization)."""
+        self.prev_pose_xy = None
+        self.prev_heading = None
+        self.lagged_v_imu = None
+        self.lagged_w_imu = None
+        self._smooth_omega = None
 
         # 1. Loop through all 3 modules to initialize their flat states
         for i, c_size in enumerate(CANN_SIZES):
@@ -280,15 +296,17 @@ class PoseCANN:
         self._u_ring = jnp.tile(0.5 * bump_r[None, :], (B, 1))
         self._r_ring = jnp.clip(self._u_ring, 0, 1.0)
         
-        self.W_cereb_xy = jnp.ones((B, self.n_speed_neurons)) * VEL_GAIN_XY
-        self.W_cereb_th = jnp.ones((B, self.n_speed_neurons)) * VEL_GAIN_TH
+        if getattr(self, 'W_cereb_xy', None) is None or self.W_cereb_xy.shape[0] != B:
+            self.W_cereb_xy = jnp.ones((B, self.n_speed_neurons)) * VEL_GAIN_XY
+        if getattr(self, 'W_cereb_th', None) is None or self.W_cereb_th.shape[0] != B:
+            self.W_cereb_th = jnp.ones((B, self.n_speed_neurons)) * VEL_GAIN_TH
         
         self.prev_pose_xy = None
         self.prev_heading = None
         self.lagged_v_imu = None   # 🌟 ADD THIS
         self.lagged_w_imu = None   # 🌟 ADD THIS
 
-    def initialize_from_gt(self, gt_pos, gt_heading):
+    def initialize_pose(self, gt_pos, gt_heading):
         B = gt_pos.shape[0]
         
         # 1. Initialize the 3 Grid Modules using Modulo Math
@@ -339,15 +357,26 @@ class PoseCANN:
         B = kin_t.shape[0]
         vx, vy, omega = kin_t[:, 0], kin_t[:, 1], kin_t[:, 2]
 
+        # Low-pass filter angular velocity (gyro) input using Exponential Moving Average (EMA)
+        # to filter out high-frequency (115Hz) sinusoidal wingbeat vibrations.
+        # At 50Hz CANN update rate, alpha=0.25 corresponds to a time constant of ~80ms,
+        # which effectively dampens wingbeat wobble while preserving intentional turns.
+        alpha = 0.25
+        if self._smooth_omega is None or self._smooth_omega.shape[0] != B:
+            self._smooth_omega = omega
+        else:
+            self._smooth_omega = (1.0 - alpha) * self._smooth_omega + alpha * omega
+        omega_filtered = self._smooth_omega
+
         # 1. Read the CURRENT heading from the Ring Attractor
         theta_current = ring_readout(self._r_ring)
         
         # 🌟 THE UPGRADE: Apply a Predictive Phase Lead to cancel Leaky Integrator lag!
-        predictive_lead = omega * RING_TAU_U 
+        predictive_lead = omega_filtered * RING_TAU_U 
         theta_compensated = theta_current + predictive_lead
         
         # 2nd-Order Midpoint Integration on the COMPENSATED heading
-        theta_mid = theta_compensated + (omega * DT) / 2.0
+        theta_mid = theta_compensated + (omega_filtered * DT) / 2.0
         
         # 2. Calculate the rotation matrices
         cos_t_mid = jnp.cos(theta_mid)
@@ -360,7 +389,7 @@ class PoseCANN:
         v_mag_xy = jnp.sqrt(V_map_x**2 + V_map_y**2)
 
         spikes_xy = self.vel_coder_xy(v_mag_xy)
-        spikes_th = self.vel_coder_th(jnp.abs(omega))
+        spikes_th = self.vel_coder_th(jnp.abs(omega_filtered))
 
         dynamic_gain_xy = jnp.sum(spikes_xy * self.W_cereb_xy, axis=1)
         dynamic_gain_th = jnp.sum(spikes_th * self.W_cereb_th, axis=1)
@@ -395,7 +424,7 @@ class PoseCANN:
             self._r_canns[i] = (r_raw / global_inhibition) * baseline_inhibition
 
         # ---- Ring: angular velocity injection ----
-        I_vel_raw = -dynamic_gain_th[:, None] * omega[:, None] * jnp.einsum('ij,bj->bi', self.W_ring_asym, self._r_ring)
+        I_vel_raw = -dynamic_gain_th[:, None] * omega_filtered[:, None] * jnp.einsum('ij,bj->bi', self.W_ring_asym, self._r_ring)
         I_vel_smooth = (jnp.roll(I_vel_raw, 1, axis=1) + I_vel_raw + jnp.roll(I_vel_raw, -1, axis=1)) / 3.0
 
         u_ring_new = neural_field_update(
@@ -423,7 +452,7 @@ class PoseCANN:
 
     def update_cerebellum(self, kin_t, pose_xy, current_heading, dt=DT):
         # 🌟 BULLETPROOF INIT: Check if the lagged variables exist yet!
-        # This catches cases where initialize_from_gt() pre-filled prev_pose_xy.
+        # This catches cases where initialize_pose() pre-filled prev_pose_xy.
         if getattr(self, 'lagged_v_imu', None) is None or self.prev_pose_xy is None:
             self.prev_pose_xy = pose_xy
             self.prev_heading = current_heading
@@ -460,8 +489,10 @@ class PoseCANN:
         speed_spikes_xy = self.vel_coder_xy(v_imu_mag)
         speed_spikes_th = self.vel_coder_th(jnp.abs(v_imu_omega))
 
-        base_eta_xy = 0.10  # Restored to a healthy rate
-        base_eta_th = 0.22  
+        base_eta_xy = 0.1  # Set learning rate to 0.1
+        base_eta_th = 0.15  # Set learning rate to 0.15
+
+
         
         # Soften the adrenaline so it amplifies without exploding
         adrenaline_xy = 1.0 + 1.0 * jnp.abs(error_forward[:, None])
@@ -473,8 +504,9 @@ class PoseCANN:
         delta_W_xy = dynamic_eta_xy * error_forward[:, None] * jnp.sign(v_imu_forward)[:, None] * speed_spikes_xy
         delta_W_th = dynamic_eta_th * error_omega[:, None] * jnp.sign(v_imu_omega)[:, None] * speed_spikes_th
 
-        self.W_cereb_xy = jnp.clip(self.W_cereb_xy + delta_W_xy, 0.01, 0.60)
-        self.W_cereb_th = jnp.clip(self.W_cereb_th + delta_W_th, 0.01, 0.60)
+        self.W_cereb_xy = jnp.clip(self.W_cereb_xy + delta_W_xy, 0.001, 1.0)   # Allows correct gain scaling in 2m room
+        self.W_cereb_th = jnp.clip(self.W_cereb_th + delta_W_th, 0.01,  0.40)  # Raised max heading gain to 0.40
+
 
         self.prev_pose_xy = pose_xy
         self.prev_heading = current_heading

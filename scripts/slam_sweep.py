@@ -11,9 +11,9 @@ Usage:
     python slam_sweep.py --quick            # 20-trial fast scan
 """
 import sys, os, time, json
-ROOT = '/Users/lhooz/.openclaw/workspace'
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-sys.path.insert(0, os.path.join(ROOT, 'src/stable1'))
+sys.path.insert(0, os.path.join(ROOT, 'src'))
 os.environ['MPLBACKEND'] = 'Agg'
 os.environ['CUDA_VISIBLE_DEVICES'] = ''  # force CPU
 
@@ -26,7 +26,7 @@ import itertools
 from multiprocessing import Pool, cpu_count
 import argparse
 
-import src.stable1.snn_slam_system as S
+import src.snn_slam_system as S
 import src.snn_place_cells as PC
 import src.snn_pose_cann as PoseMod
 
@@ -66,8 +66,8 @@ def run_headless_trial(params: dict, seed: int = 42, n_steps: int = 2000,
     system_ol.reset(1); system_cl.reset(1)
 
     _, _, _, pos0, th0, _ = env.step()
-    system_ol.initialize_from_gt(jnp.array([pos0]), jnp.array([th0]))
-    system_cl.initialize_from_gt(jnp.array([pos0]), jnp.array([th0]))
+    system_ol.initialize_pose(jnp.array([pos0]), jnp.array([th0]))
+    system_cl.initialize_pose(jnp.array([pos0]), jnp.array([th0]))
 
     gt_pos_hist = []
     imu_pos_hist = []

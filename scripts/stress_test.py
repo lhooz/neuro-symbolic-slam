@@ -5,9 +5,9 @@ Targeted stress test for SNN SLAM v7:
 2. MAX_NODES limit (push to 1001 nodes and observe crash)
 """
 import sys, os, time
-ROOT = '/Users/lhooz/.openclaw/workspace'
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-sys.path.insert(0, os.path.join(ROOT, 'src/stable1'))
+sys.path.insert(0, os.path.join(ROOT, 'src'))
 
 os.environ['MPLBACKEND'] = 'Agg'
 
@@ -23,7 +23,7 @@ from src.sparse_forest import generate_fixed_room_dataset
 from src.snn_vision_fusion import DualStreamVisionCortex
 from src.snn_pose_cann import PoseCANN
 from src.snn_place_cells import PlaceCellNetwork
-import src.stable1.snn_slam_system as stable_slam
+import src.snn_slam_system as stable_slam
 LiveEnvironment = stable_slam.LiveEnvironment
 SpikingOccupancyGrid = stable_slam.SpikingOccupancyGrid
 ToFPopulationCoder = stable_slam.ToFPopulationCoder
@@ -76,8 +76,8 @@ plt.axhline(sog.v_th * sog.beta, color='orange', ls=':', label=f'V_leak≈{sog.v
 plt.xlabel('Hover Steps'); plt.ylabel('Max Membrane Voltage (V)')
 plt.title('SOG Voltage vs Hover Time (No V_MAX Cap)')
 plt.legend(); plt.grid(alpha=0.3)
-plt.savefig('/Users/lhooz/.openclaw/workspace/sog_voltage_test.png', dpi=150)
-print(f"  💾 Saved: sog_voltage_test.png")
+plt.savefig(os.path.join(ROOT, 'sog_voltage_test.png'), dpi=150)
+print(f"  💾 Saved: {os.path.join(ROOT, 'sog_voltage_test.png')}")
 
 # ─── TEST 2: NODE ACCUMULATION ────────────────────────────────
 print("\n📍 TEST 2: Node Accumulation Rate (How fast do we hit 1000?)")

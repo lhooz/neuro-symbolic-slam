@@ -34,6 +34,8 @@ import collections
 import io          # 🌟 NEW: For safe memory buffers
 import imageio     # 🌟 NEW: For GIF generation
 
+
+
 # ============================================================================
 # WORKSPACE
 # ============================================================================
@@ -84,7 +86,7 @@ N_DEPTH_PER_RAY = 64
 N_DEPTH         = N_DEPTH_PER_RAY * 3  # 192 Total Apical Dendrites
 
 TOF_MIN         = 0.1    # meters
-TOF_MAX         = 9.9    # meters
+TOF_MAX         = 2.83   # meters — max diagonal of 2m×2m room (√(2²+2²))
 TOF_SIGMA       = 0.25   # tof precision
 
 DRIFT_START     = 5000     # (Offline Default) step at which drift kicks in
@@ -378,6 +380,51 @@ def get_phase_correlation(live_csnn, mem_csnn):
     r = jnp.fft.ifft(cross_power_norm)
     return jnp.abs(r)
 
+
+@jax.jit
+def get_dvs_rotation_shift(curr_ts, prev_ts):
+    """
+    Computes visual rotation shift and Peak-to-Sidelobe Ratio (PSR) confidence
+    between consecutive time surfaces using 1D phase correlation.
+    """
+    curr_on = curr_ts[:, :N_PIXELS]
+    curr_off = curr_ts[:, N_PIXELS:]
+    prev_on = prev_ts[:, :N_PIXELS]
+    prev_off = prev_ts[:, N_PIXELS:]
+    
+    r_on = get_phase_correlation(curr_on, prev_on)
+    r_off = get_phase_correlation(curr_off, prev_off)
+    r_real = r_on + r_off
+    
+    N_PAD = N_PIXELS * 2
+    search_radius = 15
+    
+    idx = jnp.arange(N_PAD)
+    mask = (idx <= search_radius) | (idx >= N_PAD - search_radius)
+    r_masked = jnp.where(mask[None, :], r_real, -1e9)
+    
+    peak_idx = jnp.argmax(r_masked, axis=1)
+    
+    y2 = jnp.take_along_axis(r_real, peak_idx[:, None], axis=1)[:, 0]
+    y1 = jnp.take_along_axis(r_real, ((peak_idx - 1) % N_PAD)[:, None], axis=1)[:, 0]
+    y3 = jnp.take_along_axis(r_real, ((peak_idx + 1) % N_PAD)[:, None], axis=1)[:, 0]
+    
+    denom = 2.0 * (y1 - 2.0 * y2 + y3)
+    sub_pixel_offset = jnp.clip((y1 - y3) / (denom - 1e-8), -1.0, 1.0)
+    
+    shift_int = jnp.where(peak_idx <= search_radius, peak_idx, peak_idx - N_PAD)
+    pixel_shift = shift_int + sub_pixel_offset
+    
+    pixel_ang_res = jnp.radians(FOV_DEG) / N_PIXELS
+    sub_pixel_th = -pixel_shift * pixel_ang_res
+    
+    # Calculate PSR (Peak-to-Sidelobe Ratio) as confidence
+    mean_val = jnp.mean(r_real, axis=1)
+    psr = y2 / (mean_val + 1e-8)
+    
+    return sub_pixel_th, psr
+
+
 # ============================================================================
 #  ⚖️ SOTA GAUGE ALIGNMENT (UMEYAMA'S ALGORITHM)
 # ============================================================================
@@ -496,7 +543,9 @@ class SNNSLAMSystem:
         
         # 🌟 NEW: The Cerebellum's internal calibration model
         self.learned_omega_bias = 0.0
-        self.last_decoded_xy = None  # 🌟 NEW: Temporal anchor for Grid decoding
+        self.last_decoded_xy = None   # temporal anchor for phase unwrapping
+        self.prev_decoded_xy = None   # one step earlier — used for linear extrapolation
+        self.prev_time_surface = None # previous event time surface for visual odometry
 
     def reset(self, B):
         self.vision_state = self.vision.init_state(B)
@@ -504,19 +553,22 @@ class SNNSLAMSystem:
         self.pose.reset(B)
         self._initialized = False
         self._step = 0
-        self.last_decoded_xy = None  # 🌟 NEW
+        self.last_decoded_xy = None
+        self.prev_decoded_xy = None
+        self.prev_time_surface = None
 
     def inject_stdp_memory(self, recovered_stdp_weights):
         """🌟 NEW: Overwrites the live working memory with the episodic Hash Map snapshot."""
         new_stdp_state = self.vision_state.stdp_state._replace(W=recovered_stdp_weights)
         self.vision_state = self.vision_state._replace(stdp_state=new_stdp_state)
 
-    def initialize_from_gt(self, gt_pos, gt_heading):
-        self.pose.initialize_from_gt(gt_pos, gt_heading)
+    def initialize_pose(self, gt_pos, gt_heading):
+        self.pose.initialize_pose(gt_pos, gt_heading)
         pose_bump = self.pose.get_state_flat()
         ring_bump = self.pose.get_ring_activity()
         self.place_state = self.place.initialize_from_pose(self.place_state, pose_bump, ring_bump=ring_bump)
-        self.last_decoded_xy = gt_pos[:, :2]  # 🌟 NEW: Anchor instantly updates on Loop Closures!
+        self.last_decoded_xy = gt_pos[:, :2]
+        self.prev_decoded_xy = gt_pos[:, :2]  # bootstrap: prev == last so first-frame step = 0
         self._initialized = True
 
     def calibrate_cerebellum(self, accumulated_error_rads, time_elapsed_sec):
@@ -545,7 +597,39 @@ class SNNSLAMSystem:
     def phase_odometry(self, kin_t, inject_drift=False):
         # 🌟 CEREBELLUM INTERVENTION: Subtract the learned bias from the raw hardware!
         corrected_omega = kin_t[:, 2] - self.learned_omega_bias
-        kin_corrected = jnp.stack([kin_t[:, 0], kin_t[:, 1], corrected_omega], axis=1)
+        
+        # DVS Visual Odometry: calculate relative rotation shift using SOTA phase correlation
+        # on the spatial time surface between consecutive frames.
+        curr_ts = self.vision_state.time_surface
+        
+        if self.prev_time_surface is not None:
+            # Grab current visual activity level from vis_csnn
+            csnn_clean = jnp.maximum(0.0, self.vision_state.csnn_trace)
+            vis_csnn = csnn_clean / (jnp.linalg.norm(csnn_clean, axis=-1, keepdims=True) + 1e-8)
+            top16_vis = jnp.sort(vis_csnn, axis=1)[:, -16:]
+            vis_act = jnp.mean(top16_vis, axis=1)
+            
+            # Compute phase correlation, sub-pixel shift, and peak PSR confidence
+            sub_pixel_th, psr = get_dvs_rotation_shift(curr_ts, self.prev_time_surface)
+            omega_vis = jnp.clip(sub_pixel_th / DT, -6.0, 6.0)
+            
+            # Calculate dynamic blending weight based on PSR confidence
+            # Below PSR = 4.0: trust is 0. Above PSR = 8.0: trust is 1.0 (fully trusted)
+            vis_trust = jnp.clip((psr - 4.0) / 4.0, 0.0, 1.0)
+            
+            # Blend visual velocity with IMU yaw rate using the dynamic confidence weight.
+            # Max blending weight is 0.40.
+            base_gamma = 0.40
+            gamma = jnp.where(vis_act >= 0.08, base_gamma * vis_trust, 0.0)
+            
+            # Apply dynamic complementary blending
+            fused_omega = (1.0 - gamma) * corrected_omega + gamma * omega_vis
+        else:
+            fused_omega = corrected_omega
+            
+        self.prev_time_surface = curr_ts
+        
+        kin_corrected = jnp.stack([kin_t[:, 0], kin_t[:, 1], fused_omega], axis=1)
 
         if inject_drift:
             # We inject the factory drift onto the CORRECTED signal
@@ -554,14 +638,46 @@ class SNNSLAMSystem:
         else:
             kin_injected = kin_corrected
 
+        # Capture the pre-update heading so the predicted displacement is in the
+        # correct global frame (matches what the CANN __call__ uses internally).
+        theta_pre = self.pose.estimate_heading()  # ring readout BEFORE CANN update
+
         pose_est = self.pose(kin_injected)
         
         # 🌟 THE UPGRADE: Grab the raw 579-dim Grid Key and decode it!
         pose_bump = self.pose.get_state_flat()
-        decoded_xy = decode_grid_to_xy(pose_bump, self.last_decoded_xy)
         
-        # Update the temporal anchor so the next frame knows where to look!
-        self.last_decoded_xy = decoded_xy 
+        # 🌟 FIX v3: Zero-extrapolation prior — use last decoded position directly.
+        #
+        # WHY THIS WORKS: The bump moves at most ~3 cm/step (1.5 m/s × 0.02s),
+        # while the smallest alias distance is WRAP_SCALES[0]/2 = 0.30 m.
+        # That's a 10× safety margin — the prior is ALWAYS well within the
+        # correct Voronoi cell of the true phase.
+        #
+        # WHY THE OLD APPROACH FAILED:
+        # 1. Linear extrapolation assumed constant velocity direction in the
+        #    global frame.  During turns the extrapolated prior diverged from
+        #    the actual bump direction.
+        # 2. The jump guard (which rejected decoded positions far from the
+        #    extrapolation) created a fatal feedback loop: once it fired, the
+        #    prior was locked to the (wrong) extrapolation, causing the guard
+        #    to fire every subsequent step — permanently disconnecting the
+        #    decoded position from the actual CANN bump.
+        # 3. The "invisible boundary" the user saw was the first turn, where
+        #    extrapolation direction ≠ bump direction triggered the loop.
+        # Rotate local IMU velocity to global frame for a velocity-based prior prediction
+        vx, vy = kin_injected[:, 0], kin_injected[:, 1]
+        cos_th = jnp.cos(theta_pre)
+        sin_th = jnp.sin(theta_pre)
+        V_map_x = vx * cos_th - vy * sin_th
+        V_map_y = vx * sin_th + vy * cos_th
+        predicted_xy = self.last_decoded_xy  # 🌟 Zero-extrapolation prior (prevents turn/drift divergence)
+        
+        decoded_xy = decode_grid_to_xy(pose_bump, predicted_xy)
+        
+        # Advance the two-frame history (kept for cerebellum velocity computation)
+        self.prev_decoded_xy = self.last_decoded_xy
+        self.last_decoded_xy = decoded_xy
         
         # Update Cerebellum using the newly decoded position
         self.pose.update_cerebellum(kin_injected, decoded_xy, pose_est[:, 2])
@@ -602,6 +718,9 @@ class SNNSLAMSystem:
 
         pose_est, pose_bump, ring_bump = self.phase_odometry(kin_t, inject_drift)
         
+        # 🌟 FIX: Update last_decoded_xy so the next frame unwraps around the NEW position!
+        self.last_decoded_xy = pose_est[:, :2]
+
         # 🌟 UPGRADE: Pass the continuous heading (pose_est[:, 2]) into the mapping phase!
         r_place, r_ring = self.phase_mapping(dual_vis_features, tof_features, pose_bump, ring_bump, pose_est[:, 2], kin_t[:, 2])
 

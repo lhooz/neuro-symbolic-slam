@@ -58,9 +58,9 @@ from snn_slam_system import (
 #  🚀 LIVE SLAM ORCHESTRATOR
 # ============================================================================
 
-def get_ray_indices(cx, cy, cth, tof_dists, tof_angles, res=0.10, grid_size=300, offset_m=10.0, max_rays=500): 
+def get_ray_indices(cx, cy, cth, tof_dists, tof_angles, res=0.04, grid_size=50, offset_m=0.0, max_rays=500): 
     hit_idx, free_idx = [], []
-    MAX_VALID_RANGE = 7.4 
+    MAX_VALID_RANGE = 2.83  # max diagonal of 2m×2m room
     
     for i in range(3):
         d = tof_dists[i]
@@ -169,8 +169,8 @@ def run_live_slam(key):
     system_ol.reset(1); system_cl.reset(1)
 
     _, _, _, pos0, th0, _ = env.step()
-    system_ol.initialize_from_gt(jnp.array([pos0]), jnp.array([th0]))
-    system_cl.initialize_from_gt(jnp.array([pos0]), jnp.array([th0]))
+    system_ol.initialize_pose(jnp.array([pos0]), jnp.array([th0]))
+    system_cl.initialize_pose(jnp.array([pos0]), jnp.array([th0]))
 
     history = collections.defaultdict(list)
     x_imu, y_imu, th_imu = pos0[0], pos0[1], th0
@@ -264,12 +264,12 @@ def run_live_slam(key):
     
     _draw_room(ax_map, env.obstacles)
     
-    sog = SpikingOccupancyGrid(map_size_m=30.0, res=0.10, offset_m=10.0)
+    sog = SpikingOccupancyGrid(map_size_m=2.0, res=0.04, offset_m=0.0)  # 50×50 grid for 2m×2m room
     sog_state = sog.init_state()
     
     sog_img = ax_map.imshow(np.zeros((sog.grid_w, sog.grid_h)), 
                             cmap='magma', origin='lower', 
-                            extent=[-sog.offset_m, 30.0 - sog.offset_m, -sog.offset_m, 30.0 - sog.offset_m], 
+                            extent=[0.0, 2.0, 0.0, 2.0], 
                             vmin=-0.2, vmax=1.0, alpha=0.8, zorder=2)
     
     fov_poly_gt = plt.Polygon(np.zeros((3, 2)), color='deepskyblue', alpha=0.10, zorder=1)
@@ -479,11 +479,11 @@ def run_live_slam(key):
                                 # =======================================================
                                 # 🌟 BUG FIX 2: TOPOLOGICAL PHYSICAL GATE
                                 # - dth < 0.30: heading must roughly agree
-                                # - spatial_dist < 8.0: gross sanity (wide, drift-tolerant)
-                                # - tof_diff < 1.5: local geometry must agree
+                                # - spatial_dist < 2.0: room-width sanity gate (was 8.0 in 10m room)
+                                # - tof_diff < 0.5: local geometry agree (was 1.5; tighter for 2m room)
                                 # - topological_dist > 50: must be far enough in graph time
                                 # =======================================================
-                                if dth < 0.30 and spatial_dist < 8.0 and tof_diff < 1.5 and topological_dist > 50: 
+                                if dth < 0.30 and spatial_dist < 2.0 and tof_diff < 0.5 and topological_dist > 50:  # 2m room: gates scaled ÷4
                                     
                                     # 🌟 THE LOCAL DISAMBIGUATION FITNESS SCORE
                                     vis_score = overlaps[candidate_nid] 
@@ -493,7 +493,12 @@ def run_live_slam(key):
                                         best_fitness_score = fitness
                                         matched_node = int(candidate_nid)
                                 else:
-                                    pass
+                                    reasons = []
+                                    if dth >= 0.30: reasons.append(f"dth={dth:.2f} >= 0.30")
+                                    if spatial_dist >= 2.0: reasons.append(f"spatial_dist={spatial_dist:.2f} >= 2.0")
+                                    if tof_diff >= 0.5: reasons.append(f"tof_diff={tof_diff:.2f} >= 0.5")
+                                    if topological_dist <= 50: reasons.append(f"topo_dist={topological_dist} <= 50")
+                                    print(f"\n   ↳ Candidate {candidate_nid} failed physical gates: {', '.join(reasons)}")
                                     
                             if matched_node is None:
                                 print(f"\n 🛡️ BOUNCER REJECTED: Found {len(valid_candidates)} visual matches, but ALL failed physical drift/FOV limits!")
@@ -685,7 +690,7 @@ def run_live_slam(key):
                                     
                                     b = (P_mx - P_cx) * np.array(normals_x) + (P_my - P_cy) * np.array(normals_y)
                                         
-                                    valid_mask = (curr_tof < 7.4) & (mem_tof < 7.4) & (np.abs(b) < 0.40)
+                                    valid_mask = (curr_tof < 2.83) & (mem_tof < 2.83) & (np.abs(b) < 0.40)  # 2m room: room diagonal
                                         
                                     # 🌟 TIER 3 FIX: Require ALL 3 rays valid (was 2 — too fragile)
                                     if np.sum(valid_mask) >= 3:
@@ -712,7 +717,7 @@ def run_live_slam(key):
                                             lc_offset_y = float(np.clip(offset_xy[1], -0.75, 0.75))
                                             
                                             # Verify the shift explains ALL in-range rays
-                                            in_range = (curr_tof < 7.4) & (mem_tof < 7.4)
+                                            in_range = (curr_tof < 2.83) & (mem_tof < 2.83)  # 2m room diagonal
                                             explained_b = lc_offset_x * np.array(normals_x) + lc_offset_y * np.array(normals_y)
                                             residuals = np.abs(b - explained_b)
                                             
@@ -930,7 +935,7 @@ def run_live_slam(key):
                 # we ACTUALLY snapped to a new Loop Closure coordinate!
                 # ==================================================
                 if lc_success:
-                    system_cl.initialize_from_gt(jnp.array([[corr_x, corr_y]]), jnp.array([corr_th]))
+                    system_cl.initialize_pose(jnp.array([[corr_x, corr_y]]), jnp.array([corr_th]))
                     
                     # 🌟 FIX: Soft-blend reconsolidation — retrieved memory blended with current state
                     if matched_node in stdp_memory_bank:
