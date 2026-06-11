@@ -556,6 +556,8 @@ class SNNSLAMSystem:
         self.last_decoded_xy = None
         self.prev_decoded_xy = None
         self.prev_time_surface = None
+        self._theta_gravity = jnp.zeros((B,))
+        self._smooth_acc = None
 
     def inject_stdp_memory(self, recovered_stdp_weights):
         """🌟 NEW: Overwrites the live working memory with the episodic Hash Map snapshot."""
@@ -569,6 +571,8 @@ class SNNSLAMSystem:
         self.place_state = self.place.initialize_from_pose(self.place_state, pose_bump, ring_bump=ring_bump)
         self.last_decoded_xy = gt_pos[:, :2]
         self.prev_decoded_xy = gt_pos[:, :2]  # bootstrap: prev == last so first-frame step = 0
+        self._theta_gravity = gt_heading
+        self._smooth_acc = None
         self._initialized = True
 
     def calibrate_cerebellum(self, accumulated_error_rads, time_elapsed_sec):
@@ -587,14 +591,14 @@ class SNNSLAMSystem:
         tof_pop = self.tof_coder(tof_t)
         return dual_vis_features, tof_pop
 
-    def phase_inference(self, dual_vis_features, tof_features, pose_bump, current_heading_rads, ring_bump): # 🌟 CHANGED
+    def phase_inference(self, dual_vis_features, tof_features, pose_bump, current_heading_rads, ring_bump): 
         vis_csnn, vis_stdp = dual_vis_features
         self.place_state, is_confident, peak_idx_place, debug_gates = self.place.compute_confidence_with_gates(
-            self.place_state, vis_csnn, vis_stdp, tof_features, pose_bump, current_heading_rads, ring_bump # 🌟 CHANGED
+            self.place_state, vis_csnn, vis_stdp, tof_features, pose_bump, current_heading_rads, ring_bump 
         )
         return is_confident, peak_idx_place, debug_gates
 
-    def phase_odometry(self, kin_t, inject_drift=False):
+    def phase_odometry(self, kin_t, theta_gravity=None, inject_drift=False):
         # 🌟 CEREBELLUM INTERVENTION: Subtract the learned bias from the raw hardware!
         corrected_omega = kin_t[:, 2] - self.learned_omega_bias
         
@@ -642,7 +646,7 @@ class SNNSLAMSystem:
         # correct global frame (matches what the CANN __call__ uses internally).
         theta_pre = self.pose.estimate_heading()  # ring readout BEFORE CANN update
 
-        pose_est = self.pose(kin_injected)
+        pose_est = self.pose(kin_injected, theta_gravity=theta_gravity)
         
         # 🌟 THE UPGRADE: Grab the raw 579-dim Grid Key and decode it!
         pose_bump = self.pose.get_state_flat()
@@ -699,7 +703,7 @@ class SNNSLAMSystem:
         
         return r_place, r_ring
 
-    def forward_step(self, events_t, kin_t, tof_t, inject_drift=False, autopilot_on=True):
+    def forward_step(self, events_t, kin_t, tof_t, acc_t=None, inject_drift=False, autopilot_on=True):
         # Pass the flag into phase_perception to pause STDP when surprised
         dual_vis_features, tof_features = self.phase_perception(events_t, tof_t, learn=autopilot_on)
 
@@ -716,7 +720,38 @@ class SNNSLAMSystem:
             dual_vis_features, tof_features, pose_bump_prior, current_heading_rads, ring_bump_prior # 🌟 CHANGED
         )
 
-        pose_est, pose_bump, ring_bump = self.phase_odometry(kin_t, inject_drift)
+        # Complementary Filter state estimator for gravity direction (pitch correction)
+        if acc_t is not None:
+            # 1. Low-pass filter the accelerometer readings (EMA) to suppress high-frequency flapping vibration
+            alpha_acc = 0.1
+            if self._smooth_acc is None or self._smooth_acc.shape[0] != acc_t.shape[0]:
+                self._smooth_acc = acc_t
+            else:
+                self._smooth_acc = (1.0 - alpha_acc) * self._smooth_acc + alpha_acc * acc_t
+            
+            # 2. Extract pitch angle from proper acceleration (acc_x, acc_z)
+            ax = self._smooth_acc[:, 0]
+            az = self._smooth_acc[:, 1]
+            theta_accel = jnp.arctan2(ax, az) + 1.0
+            theta_accel = wrap_angle(theta_accel)
+            
+            # 3. Integrate gyroscope rate (corrected for learned bias)
+            corrected_omega = kin_t[:, 2] - self.learned_omega_bias
+            theta_gyro = self._theta_gravity + corrected_omega * 0.02
+            theta_gyro = wrap_angle(theta_gyro)
+            
+            # 4. Fuse using Complementary Filter
+            alpha_fuse = 0.05
+            diff = wrap_angle(theta_accel - theta_gyro)
+            self._theta_gravity = wrap_angle(theta_gyro + alpha_fuse * diff)
+            
+            theta_gravity_val = self._theta_gravity
+        else:
+            theta_gravity_val = None
+
+        pose_est, pose_bump, ring_bump = self.phase_odometry(
+            kin_t, theta_gravity=theta_gravity_val, inject_drift=inject_drift
+        )
         
         # 🌟 FIX: Update last_decoded_xy so the next frame unwraps around the NEW position!
         self.last_decoded_xy = pose_est[:, :2]

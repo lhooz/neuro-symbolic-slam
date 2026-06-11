@@ -353,7 +353,7 @@ class PoseCANN:
         self.lagged_v_imu = None   # 🌟 ADD THIS
         self.lagged_w_imu = None   # 🌟 ADD THIS
 
-    def __call__(self, kin_t):
+    def __call__(self, kin_t, theta_gravity=None):
         B = kin_t.shape[0]
         vx, vy, omega = kin_t[:, 0], kin_t[:, 1], kin_t[:, 2]
 
@@ -427,9 +427,21 @@ class PoseCANN:
         I_vel_raw = -dynamic_gain_th[:, None] * omega_filtered[:, None] * jnp.einsum('ij,bj->bi', self.W_ring_asym, self._r_ring)
         I_vel_smooth = (jnp.roll(I_vel_raw, 1, axis=1) + I_vel_raw + jnp.roll(I_vel_raw, -1, axis=1)) / 3.0
 
+        I_ext = I_vel_smooth
+        if theta_gravity is not None:
+            # preferred angles of 64 Ring Attractor neurons representing [-pi, pi]
+            angles = jnp.arange(RING_N, dtype=jnp.float32) * (2.0 * jnp.pi / RING_N)
+            diff = angles[None, :] - theta_gravity[:, None]
+            diff_wrapped = jnp.mod(diff + jnp.pi, 2 * jnp.pi) - jnp.pi
+            
+            K_GRAVITY = 0.50
+            SIGMA_GRAVITY = 0.25
+            I_gravity = K_GRAVITY * jnp.exp(- (diff_wrapped ** 2) / (2.0 * (SIGMA_GRAVITY ** 2)))
+            I_ext = I_ext + I_gravity
+
         u_ring_new = neural_field_update(
             self._u_ring, self._r_ring + 1e-8, self.W_ring,
-            I_vel_smooth, 
+            I_ext, 
             dt=DT, tau=RING_TAU_U
         )
 
