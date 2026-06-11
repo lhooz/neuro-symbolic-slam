@@ -732,7 +732,7 @@ class SNNSLAMSystem:
             # 2. Extract pitch angle from proper acceleration (acc_x, acc_z)
             ax = self._smooth_acc[:, 0]
             az = self._smooth_acc[:, 1]
-            theta_accel = jnp.arctan2(ax, az) + 1.0
+            theta_accel = jnp.arctan2(ax, az)
             theta_accel = wrap_angle(theta_accel)
             
             # 3. Integrate gyroscope rate (corrected for learned bias)

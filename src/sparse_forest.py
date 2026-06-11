@@ -322,7 +322,9 @@ def _sample_barcode_fast(min_idx, nearest, min_dist, obstacles, tex_tensor):
         )
     ) 
 
-    t_wall_selected = jnp.take_along_axis(t_wall, min_idx[:, None], axis=1)[:, 0]
+    # Clip min_idx to [0, 3] to prevent out-of-bounds lookup on t_wall (which only has 4 columns)
+    safe_min_idx = jnp.clip(min_idx, 0, 3)
+    t_wall_selected = jnp.take_along_axis(t_wall, safe_min_idx[:, None], axis=1)[:, 0]
     t_all = jnp.where(is_wall, t_wall_selected, t_obs) 
 
     tex_for_pix = jnp.take(tex_tensor, min_idx, axis=0, mode='clip') 
