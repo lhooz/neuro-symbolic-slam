@@ -559,6 +559,30 @@ class SNNSLAMSystem:
         self._theta_gravity = jnp.zeros((B,))
         self._smooth_acc = None
 
+    def reset_pose_only(self, B):
+        """🌟 NEW: Resets active pose tracker and temporal traces on crash, but PRESERVES the learned Hebbian map weights (W_seq_to_place, etc.)."""
+        if self.place_state is not None:
+            self.place_state = self.place_state._replace(
+                trace_csnn=jnp.zeros_like(self.place_state.trace_csnn),
+                trace_stdp=jnp.zeros_like(self.place_state.trace_stdp),
+                trace_tof=jnp.zeros_like(self.place_state.trace_tof),
+                trace_place=jnp.zeros_like(self.place_state.trace_place),
+                trace_ring=jnp.zeros_like(self.place_state.trace_ring),
+                confidence_counter=jnp.zeros_like(self.place_state.confidence_counter)
+            )
+        else:
+            self.place_state = self.place.init_state(B)
+
+        self.vision_state = self.vision.init_state(B)
+        self.pose.reset(B)
+        self._initialized = False
+        self._step = 0
+        self.last_decoded_xy = None
+        self.prev_decoded_xy = None
+        self.prev_time_surface = None
+        self._theta_gravity = jnp.zeros((B,))
+        self._smooth_acc = None
+
     def inject_stdp_memory(self, recovered_stdp_weights):
         """🌟 NEW: Overwrites the live working memory with the episodic Hash Map snapshot."""
         new_stdp_state = self.vision_state.stdp_state._replace(W=recovered_stdp_weights)
