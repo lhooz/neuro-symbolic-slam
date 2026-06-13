@@ -437,7 +437,7 @@ class PoseCANN:
             diff = angles[None, :] - theta_gravity[:, None]
             diff_wrapped = jnp.mod(diff + jnp.pi, 2 * jnp.pi) - jnp.pi
             
-            K_GRAVITY = 2.50
+            K_GRAVITY = 5.00
             SIGMA_GRAVITY = 0.25
             I_gravity = K_GRAVITY * jnp.exp(- (diff_wrapped ** 2) / (2.0 * (SIGMA_GRAVITY ** 2)))
             I_ext = I_ext + I_gravity
@@ -520,7 +520,7 @@ class PoseCANN:
         delta_W_th = dynamic_eta_th * error_omega[:, None] * jnp.sign(v_imu_omega)[:, None] * speed_spikes_th
 
         self.W_cereb_xy = jnp.clip(self.W_cereb_xy + delta_W_xy, 0.001, 1.0)   # Allows correct gain scaling in 2m room
-        self.W_cereb_th = jnp.clip(self.W_cereb_th + delta_W_th, 0.01,  0.80)  # Raised max heading gain to 0.80
+        self.W_cereb_th = jnp.clip(self.W_cereb_th + delta_W_th, 0.20,  0.80)  # Raised max heading gain to 0.80, min to 0.20
 
 
         self.prev_pose_xy = pose_xy
