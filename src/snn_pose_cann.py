@@ -353,7 +353,7 @@ class PoseCANN:
         self.lagged_v_imu = None   # 🌟 ADD THIS
         self.lagged_w_imu = None   # 🌟 ADD THIS
 
-    def __call__(self, kin_t, theta_gravity=None):
+    def __call__(self, kin_t, theta_gravity=None, dt=DT):
         B = kin_t.shape[0]
         vx, vy, omega = kin_t[:, 0], kin_t[:, 1], kin_t[:, 2]
 
@@ -376,7 +376,7 @@ class PoseCANN:
         theta_compensated = theta_current + predictive_lead
         
         # 2nd-Order Midpoint Integration on the COMPENSATED heading
-        theta_mid = theta_compensated + (omega_filtered * DT) / 2.0
+        theta_mid = theta_compensated + (omega_filtered * dt) / 2.0
         
         # 2. Calculate the rotation matrices
         cos_t_mid = jnp.cos(theta_mid)
@@ -395,13 +395,16 @@ class PoseCANN:
         dynamic_gain_th = jnp.sum(spikes_th * self.W_cereb_th, axis=1)
 
         # Iterate over the 3 spatial modules
+        # Scale velocity injection by dt/DT so bump displacement matches real elapsed time,
+        # while neural field dynamics (decay, tau) remain at intrinsic DT.
+        vel_time_scale = dt / DT
         for i, (c_size, scale) in enumerate(zip(CANN_SIZES, WRAP_SCALES)):
             r_flat = self._r_canns[i].reshape(B, -1)
             
             # Density scaling: Smaller wrap scales mean the bump must traverse neurons faster!
             density_factor = c_size / scale 
-            scaled_vel_x = V_map_x * density_factor
-            scaled_vel_y = V_map_y * density_factor
+            scaled_vel_x = V_map_x * density_factor * vel_time_scale
+            scaled_vel_y = V_map_y * density_factor * vel_time_scale
 
             I_vel_x = dynamic_gain_xy[:, None] * jnp.einsum('ij,bj->bi', self.W_cann_asym_x_list[i], r_flat) * scaled_vel_x[:, None]
             I_vel_y = dynamic_gain_xy[:, None] * jnp.einsum('ij,bj->bi', self.W_cann_asym_y_list[i], r_flat) * scaled_vel_y[:, None]
@@ -424,7 +427,7 @@ class PoseCANN:
             self._r_canns[i] = (r_raw / global_inhibition) * baseline_inhibition
 
         # ---- Ring: angular velocity injection ----
-        I_vel_raw = -dynamic_gain_th[:, None] * omega_filtered[:, None] * jnp.einsum('ij,bj->bi', self.W_ring_asym, self._r_ring)
+        I_vel_raw = -dynamic_gain_th[:, None] * omega_filtered[:, None] * vel_time_scale * jnp.einsum('ij,bj->bi', self.W_ring_asym, self._r_ring)
         I_vel_smooth = (jnp.roll(I_vel_raw, 1, axis=1) + I_vel_raw + jnp.roll(I_vel_raw, -1, axis=1)) / 3.0
 
         I_ext = I_vel_smooth

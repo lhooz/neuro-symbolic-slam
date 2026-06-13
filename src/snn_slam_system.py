@@ -622,7 +622,7 @@ class SNNSLAMSystem:
         )
         return is_confident, peak_idx_place, debug_gates
 
-    def phase_odometry(self, kin_t, theta_gravity=None, inject_drift=False):
+    def phase_odometry(self, kin_t, theta_gravity=None, inject_drift=False, dt=DT):
         # 🌟 CEREBELLUM INTERVENTION: Subtract the learned bias from the raw hardware!
         corrected_omega = kin_t[:, 2] - self.learned_omega_bias
         
@@ -639,7 +639,7 @@ class SNNSLAMSystem:
             
             # Compute phase correlation, sub-pixel shift, and peak PSR confidence
             sub_pixel_th, psr = get_dvs_rotation_shift(curr_ts, self.prev_time_surface)
-            omega_vis = jnp.clip(sub_pixel_th / DT, -6.0, 6.0)
+            omega_vis = jnp.clip(sub_pixel_th / dt, -6.0, 6.0)
             
             # Calculate dynamic blending weight based on PSR confidence
             # Below PSR = 4.0: trust is 0. Above PSR = 8.0: trust is 1.0 (fully trusted)
@@ -670,7 +670,7 @@ class SNNSLAMSystem:
         # correct global frame (matches what the CANN __call__ uses internally).
         theta_pre = self.pose.estimate_heading()  # ring readout BEFORE CANN update
 
-        pose_est = self.pose(kin_injected, theta_gravity=theta_gravity)
+        pose_est = self.pose(kin_injected, theta_gravity=theta_gravity, dt=dt)
         
         # 🌟 THE UPGRADE: Grab the raw 579-dim Grid Key and decode it!
         pose_bump = self.pose.get_state_flat()
@@ -708,7 +708,7 @@ class SNNSLAMSystem:
         self.last_decoded_xy = decoded_xy
         
         # Update Cerebellum using the newly decoded position
-        self.pose.update_cerebellum(kin_injected, decoded_xy, pose_est[:, 2])
+        self.pose.update_cerebellum(kin_injected, decoded_xy, pose_est[:, 2], dt=dt)
 
         ring_bump = self.pose.get_ring_activity()
         
@@ -727,7 +727,7 @@ class SNNSLAMSystem:
         
         return r_place, r_ring
 
-    def forward_step(self, events_t, kin_t, tof_t, acc_t=None, inject_drift=False, autopilot_on=True):
+    def forward_step(self, events_t, kin_t, tof_t, acc_t=None, inject_drift=False, autopilot_on=True, dt=DT):
         # Pass the flag into phase_perception to pause STDP when surprised
         dual_vis_features, tof_features = self.phase_perception(events_t, tof_t, learn=autopilot_on)
 
@@ -761,7 +761,7 @@ class SNNSLAMSystem:
             
             # 3. Integrate gyroscope rate (corrected for learned bias)
             corrected_omega = kin_t[:, 2] - self.learned_omega_bias
-            theta_gyro = self._theta_gravity + corrected_omega * 0.02
+            theta_gyro = self._theta_gravity + corrected_omega * dt
             theta_gyro = wrap_angle(theta_gyro)
             
             # 4. Fuse using Complementary Filter
@@ -774,7 +774,7 @@ class SNNSLAMSystem:
             theta_gravity_val = None
 
         pose_est, pose_bump, ring_bump = self.phase_odometry(
-            kin_t, theta_gravity=theta_gravity_val, inject_drift=inject_drift
+            kin_t, theta_gravity=theta_gravity_val, inject_drift=inject_drift, dt=dt
         )
         
         # 🌟 FIX: Update last_decoded_xy so the next frame unwraps around the NEW position!
