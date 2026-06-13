@@ -765,7 +765,7 @@ class SNNSLAMSystem:
             theta_gyro = wrap_angle(theta_gyro)
             
             # 4. Fuse using Complementary Filter
-            alpha_fuse = 0.05
+            alpha_fuse = 0.015
             diff = wrap_angle(theta_accel - theta_gyro)
             self._theta_gravity = wrap_angle(theta_gyro + alpha_fuse * diff)
             

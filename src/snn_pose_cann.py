@@ -76,7 +76,7 @@ V_TH = 1.0
 # The product (V_map_x * density_factor) is actually 2x smaller than before.
 # Therefore, we need to INCREASE the gain (0.10 → 0.15) and allow it to learn higher.
 VEL_GAIN_XY = 0.035     # velocity → bump shift (1:1 bump speed matching)
-VEL_GAIN_TH = 0.157     # omega → ring shift (approx 1:1 bump speed matching)
+VEL_GAIN_TH = 0.35     # omega → ring shift (approx 1:1 bump speed matching)
 
 
 
@@ -359,9 +359,9 @@ class PoseCANN:
 
         # Low-pass filter angular velocity (gyro) input using Exponential Moving Average (EMA)
         # to filter out high-frequency (115Hz) sinusoidal wingbeat vibrations.
-        # At 50Hz CANN update rate, alpha=0.25 corresponds to a time constant of ~80ms,
+        # At 50Hz CANN update rate, alpha=0.85 corresponds to a time constant of ~10ms,
         # which effectively dampens wingbeat wobble while preserving intentional turns.
-        alpha = 0.25
+        alpha = 0.85
         if self._smooth_omega is None or self._smooth_omega.shape[0] != B:
             self._smooth_omega = omega
         else:
@@ -437,7 +437,7 @@ class PoseCANN:
             diff = angles[None, :] - theta_gravity[:, None]
             diff_wrapped = jnp.mod(diff + jnp.pi, 2 * jnp.pi) - jnp.pi
             
-            K_GRAVITY = 0.50
+            K_GRAVITY = 2.50
             SIGMA_GRAVITY = 0.25
             I_gravity = K_GRAVITY * jnp.exp(- (diff_wrapped ** 2) / (2.0 * (SIGMA_GRAVITY ** 2)))
             I_ext = I_ext + I_gravity
@@ -520,7 +520,7 @@ class PoseCANN:
         delta_W_th = dynamic_eta_th * error_omega[:, None] * jnp.sign(v_imu_omega)[:, None] * speed_spikes_th
 
         self.W_cereb_xy = jnp.clip(self.W_cereb_xy + delta_W_xy, 0.001, 1.0)   # Allows correct gain scaling in 2m room
-        self.W_cereb_th = jnp.clip(self.W_cereb_th + delta_W_th, 0.01,  0.40)  # Raised max heading gain to 0.40
+        self.W_cereb_th = jnp.clip(self.W_cereb_th + delta_W_th, 0.01,  0.80)  # Raised max heading gain to 0.80
 
 
         self.prev_pose_xy = pose_xy
