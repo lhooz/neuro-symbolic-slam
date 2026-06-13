@@ -622,7 +622,7 @@ class SNNSLAMSystem:
         )
         return is_confident, peak_idx_place, debug_gates
 
-    def phase_odometry(self, kin_t, theta_gravity=None, inject_drift=False, dt=DT):
+    def phase_odometry(self, kin_t, events_t=None, tof_t=None, theta_gravity=None, inject_drift=False, dt=DT):
         # 🌟 CEREBELLUM INTERVENTION: Subtract the learned bias from the raw hardware!
         corrected_omega = kin_t[:, 2] - self.learned_omega_bias
         
@@ -630,6 +630,7 @@ class SNNSLAMSystem:
         # on the spatial time surface between consecutive frames.
         curr_ts = self.vision_state.time_surface
         
+        B = kin_t.shape[0]
         if self.prev_time_surface is not None:
             # Grab current visual activity level from vis_csnn
             csnn_clean = jnp.maximum(0.0, self.vision_state.csnn_trace)
@@ -642,22 +643,38 @@ class SNNSLAMSystem:
             omega_vis = jnp.clip(sub_pixel_th / dt, -6.0, 6.0)
             
             # Calculate dynamic blending weight based on PSR confidence
-            # Below PSR = 4.0: trust is 0. Above PSR = 8.0: trust is 1.0 (fully trusted)
-            vis_trust = jnp.clip((psr - 4.0) / 4.0, 0.0, 1.0)
-            
-            # Blend visual velocity with IMU yaw rate using the dynamic confidence weight.
-            # Max blending weight is 0.40.
-            base_gamma = 0.40
-            gamma = jnp.where(vis_act >= 0.08, base_gamma * vis_trust, 0.0)
-            
-            # Apply dynamic complementary blending
-            fused_omega = (1.0 - gamma) * corrected_omega + gamma * omega_vis
+            vis_trust_raw = jnp.clip((psr - 4.0) / 4.0, 0.0, 1.0)
+            vis_trust = jnp.where(vis_act >= 0.08, vis_trust_raw, 0.0)
         else:
-            fused_omega = corrected_omega
+            omega_vis = jnp.zeros((B,))
+            vis_trust = jnp.zeros((B,))
             
         self.prev_time_surface = curr_ts
         
-        kin_corrected = jnp.stack([kin_t[:, 0], kin_t[:, 1], fused_omega], axis=1)
+        # 🌟 Compute visual translation velocity [vx_vis, vz_vis] from Event-rate * ToF distance
+        if events_t is not None and tof_t is not None:
+            events_left = events_t[:, :128]
+            events_right = events_t[:, 128:]
+            
+            F_left = jnp.mean(jnp.abs(events_left), axis=1)
+            F_right = jnp.mean(jnp.abs(events_right), axis=1)
+            
+            d_left = tof_t[:, 0]
+            d_right = tof_t[:, 2]
+            
+            v_x_vis = 0.14 * (F_left * d_left + F_right * d_right)
+            v_z_vis = 1.00 * jnp.abs(F_left * d_left - F_right * d_right)
+            
+            # Sign the visual velocities according to the IMU velocities to prevent opposite-current conflicts!
+            v_x_vis = jnp.sign(kin_t[:, 0]) * v_x_vis
+            v_z_vis = jnp.sign(kin_t[:, 1]) * v_z_vis
+            
+            v_vis_trans = jnp.stack([v_x_vis, v_z_vis], axis=1)
+        else:
+            v_vis_trans = jnp.zeros((B, 2))
+            
+        # No pre-blending of corrected_omega here!
+        kin_corrected = jnp.stack([kin_t[:, 0], kin_t[:, 1], corrected_omega], axis=1)
 
         if inject_drift:
             # We inject the factory drift onto the CORRECTED signal
@@ -670,35 +687,19 @@ class SNNSLAMSystem:
         # correct global frame (matches what the CANN __call__ uses internally).
         theta_pre = self.pose.estimate_heading()  # ring readout BEFORE CANN update
 
-        pose_est = self.pose(kin_injected, theta_gravity=theta_gravity, dt=dt)
+        # Pass visual inputs directly into PoseCANN for direct current injection
+        pose_est = self.pose(
+            kin_injected,
+            omega_vis=omega_vis,
+            vis_trust=vis_trust,
+            v_vis_trans=v_vis_trans,
+            theta_gravity=theta_gravity,
+            dt=dt
+        )
         
         # 🌟 THE UPGRADE: Grab the raw 579-dim Grid Key and decode it!
         pose_bump = self.pose.get_state_flat()
         
-        # 🌟 FIX v3: Zero-extrapolation prior — use last decoded position directly.
-        #
-        # WHY THIS WORKS: The bump moves at most ~3 cm/step (1.5 m/s × 0.02s),
-        # while the smallest alias distance is WRAP_SCALES[0]/2 = 0.30 m.
-        # That's a 10× safety margin — the prior is ALWAYS well within the
-        # correct Voronoi cell of the true phase.
-        #
-        # WHY THE OLD APPROACH FAILED:
-        # 1. Linear extrapolation assumed constant velocity direction in the
-        #    global frame.  During turns the extrapolated prior diverged from
-        #    the actual bump direction.
-        # 2. The jump guard (which rejected decoded positions far from the
-        #    extrapolation) created a fatal feedback loop: once it fired, the
-        #    prior was locked to the (wrong) extrapolation, causing the guard
-        #    to fire every subsequent step — permanently disconnecting the
-        #    decoded position from the actual CANN bump.
-        # 3. The "invisible boundary" the user saw was the first turn, where
-        #    extrapolation direction ≠ bump direction triggered the loop.
-        # Rotate local IMU velocity to global frame for a velocity-based prior prediction
-        vx, vy = kin_injected[:, 0], kin_injected[:, 1]
-        cos_th = jnp.cos(theta_pre)
-        sin_th = jnp.sin(theta_pre)
-        V_map_x = vx * cos_th - vy * sin_th
-        V_map_y = vx * sin_th + vy * cos_th
         predicted_xy = self.last_decoded_xy  # 🌟 Zero-extrapolation prior (prevents turn/drift divergence)
         
         decoded_xy = decode_grid_to_xy(pose_bump, predicted_xy)
@@ -707,8 +708,16 @@ class SNNSLAMSystem:
         self.prev_decoded_xy = self.last_decoded_xy
         self.last_decoded_xy = decoded_xy
         
-        # Update Cerebellum using the newly decoded position
-        self.pose.update_cerebellum(kin_injected, decoded_xy, pose_est[:, 2], dt=dt)
+        # Update Cerebellum with separate IMU and Vision parameters
+        self.pose.update_cerebellum(
+            kin_injected,
+            decoded_xy,
+            pose_est[:, 2],
+            omega_vis=omega_vis,
+            vis_trust=vis_trust,
+            v_vis_trans=v_vis_trans,
+            dt=dt
+        )
 
         ring_bump = self.pose.get_ring_activity()
         
@@ -774,7 +783,12 @@ class SNNSLAMSystem:
             theta_gravity_val = None
 
         pose_est, pose_bump, ring_bump = self.phase_odometry(
-            kin_t, theta_gravity=theta_gravity_val, inject_drift=inject_drift, dt=dt
+            kin_t,
+            events_t=events_t,
+            tof_t=tof_t,
+            theta_gravity=theta_gravity_val,
+            inject_drift=inject_drift,
+            dt=dt
         )
         
         # 🌟 FIX: Update last_decoded_xy so the next frame unwraps around the NEW position!
@@ -786,10 +800,16 @@ class SNNSLAMSystem:
         self._step += 1
         return pose_est, r_place, r_ring, is_confident, peak_idx_place, debug_gates
 
-    def forward_step_open_loop(self, events_t, kin_t, tof_t, inject_drift=False):
+    def forward_step_open_loop(self, events_t, kin_t, tof_t, inject_drift=False, dt=DT):
         dual_vis_features, tof_features = self.phase_perception(events_t, tof_t)
 
-        pose_est, pose_bump, ring_bump = self.phase_odometry(kin_t, inject_drift=inject_drift)
+        pose_est, pose_bump, ring_bump = self.phase_odometry(
+            kin_t,
+            events_t=events_t,
+            tof_t=tof_t,
+            inject_drift=inject_drift,
+            dt=dt
+        )
 
         self._step += 1
         return pose_est, None, None

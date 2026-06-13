@@ -296,15 +296,21 @@ class PoseCANN:
         self._u_ring = jnp.tile(0.5 * bump_r[None, :], (B, 1))
         self._r_ring = jnp.clip(self._u_ring, 0, 1.0)
         
-        if getattr(self, 'W_cereb_xy', None) is None or self.W_cereb_xy.shape[0] != B:
-            self.W_cereb_xy = jnp.ones((B, self.n_speed_neurons)) * VEL_GAIN_XY
-        if getattr(self, 'W_cereb_th', None) is None or self.W_cereb_th.shape[0] != B:
-            self.W_cereb_th = jnp.ones((B, self.n_speed_neurons)) * VEL_GAIN_TH
+        if getattr(self, 'W_cereb_xy_imu', None) is None or self.W_cereb_xy_imu.shape[0] != B:
+            self.W_cereb_xy_imu = jnp.ones((B, self.n_speed_neurons)) * VEL_GAIN_XY
+        if getattr(self, 'W_cereb_xy_vis', None) is None or self.W_cereb_xy_vis.shape[0] != B:
+            self.W_cereb_xy_vis = jnp.ones((B, self.n_speed_neurons)) * VEL_GAIN_XY
+        if getattr(self, 'W_cereb_th_imu', None) is None or self.W_cereb_th_imu.shape[0] != B:
+            self.W_cereb_th_imu = jnp.ones((B, self.n_speed_neurons)) * VEL_GAIN_TH
+        if getattr(self, 'W_cereb_th_vis', None) is None or self.W_cereb_th_vis.shape[0] != B:
+            self.W_cereb_th_vis = jnp.ones((B, self.n_speed_neurons)) * VEL_GAIN_TH
         
         self.prev_pose_xy = None
         self.prev_heading = None
-        self.lagged_v_imu = None   # 🌟 ADD THIS
-        self.lagged_w_imu = None   # 🌟 ADD THIS
+        self.lagged_v_imu = None
+        self.lagged_v_vis = None
+        self.lagged_w_imu = None
+        self.lagged_w_vis = None
 
     def initialize_pose(self, gt_pos, gt_heading):
         B = gt_pos.shape[0]
@@ -350,12 +356,14 @@ class PoseCANN:
         # calculate a 50m/s pseudo-velocity and wipe out its learned IMU gains!
         self.prev_pose_xy = gt_pos
         self.prev_heading = gt_heading
-        self.lagged_v_imu = None   # 🌟 ADD THIS
-        self.lagged_w_imu = None   # 🌟 ADD THIS
+        self.lagged_v_imu = None
+        self.lagged_v_vis = None
+        self.lagged_w_imu = None
+        self.lagged_w_vis = None
 
-    def __call__(self, kin_t, theta_gravity=None, dt=DT):
+    def __call__(self, kin_t, omega_vis=None, vis_trust=None, v_vis_trans=None, theta_gravity=None, dt=DT):
         B = kin_t.shape[0]
-        vx, vy, omega = kin_t[:, 0], kin_t[:, 1], kin_t[:, 2]
+        vx_imu, vy_imu, omega_imu = kin_t[:, 0], kin_t[:, 1], kin_t[:, 2]
 
         # Low-pass filter angular velocity (gyro) input using Exponential Moving Average (EMA)
         # to filter out high-frequency (115Hz) sinusoidal wingbeat vibrations.
@@ -363,36 +371,47 @@ class PoseCANN:
         # which effectively dampens wingbeat wobble while preserving intentional turns.
         alpha = 0.85
         if self._smooth_omega is None or self._smooth_omega.shape[0] != B:
-            self._smooth_omega = omega
+            self._smooth_omega = omega_imu
         else:
-            self._smooth_omega = (1.0 - alpha) * self._smooth_omega + alpha * omega
-        omega_filtered = self._smooth_omega
+            self._smooth_omega = (1.0 - alpha) * self._smooth_omega + alpha * omega_imu
+        omega_imu_filtered = self._smooth_omega
 
         # 1. Read the CURRENT heading from the Ring Attractor
         theta_current = ring_readout(self._r_ring)
         
         # 🌟 THE UPGRADE: Apply a Predictive Phase Lead to cancel Leaky Integrator lag!
-        predictive_lead = omega_filtered * RING_TAU_U 
+        predictive_lead = omega_imu_filtered * RING_TAU_U 
         theta_compensated = theta_current + predictive_lead
         
         # 2nd-Order Midpoint Integration on the COMPENSATED heading
-        theta_mid = theta_compensated + (omega_filtered * dt) / 2.0
+        theta_mid = theta_compensated + (omega_imu_filtered * dt) / 2.0
         
         # 2. Calculate the rotation matrices
         cos_t_mid = jnp.cos(theta_mid)
         sin_t_mid = jnp.sin(theta_mid)
 
-        # 3. Rotate the local velocities into the global map frame
-        V_map_x = vx * cos_t_mid - vy * sin_t_mid
-        V_map_y = vx * sin_t_mid + vy * cos_t_mid
+        # 3. Rotate the local velocities into the global map frame (IMU)
+        V_map_x_imu = vx_imu * cos_t_mid - vy_imu * sin_t_mid
+        V_map_y_imu = vx_imu * sin_t_mid + vy_imu * cos_t_mid
 
-        v_mag_xy = jnp.sqrt(V_map_x**2 + V_map_y**2)
+        v_mag_xy_imu = jnp.sqrt(V_map_x_imu**2 + V_map_y_imu**2)
+        spikes_xy_imu = self.vel_coder_xy(v_mag_xy_imu)
+        dynamic_gain_xy_imu = jnp.sum(spikes_xy_imu * self.W_cereb_xy_imu, axis=1)
 
-        spikes_xy = self.vel_coder_xy(v_mag_xy)
-        spikes_th = self.vel_coder_th(jnp.abs(omega_filtered))
-
-        dynamic_gain_xy = jnp.sum(spikes_xy * self.W_cereb_xy, axis=1)
-        dynamic_gain_th = jnp.sum(spikes_th * self.W_cereb_th, axis=1)
+        # 4. Rotate local velocities for Vision (Optic Flow + ToF scaling)
+        if v_vis_trans is not None:
+            vx_vis = v_vis_trans[:, 0]
+            vy_vis = v_vis_trans[:, 1]
+            V_map_x_vis = vx_vis * cos_t_mid - vy_vis * sin_t_mid
+            V_map_y_vis = vx_vis * sin_t_mid + vy_vis * cos_t_mid
+            
+            v_mag_xy_vis = jnp.sqrt(V_map_x_vis**2 + V_map_y_vis**2)
+            spikes_xy_vis = self.vel_coder_xy(v_mag_xy_vis)
+            dynamic_gain_xy_vis = jnp.sum(spikes_xy_vis * self.W_cereb_xy_vis, axis=1)
+        else:
+            V_map_x_vis = jnp.zeros_like(V_map_x_imu)
+            V_map_y_vis = jnp.zeros_like(V_map_y_imu)
+            dynamic_gain_xy_vis = jnp.zeros_like(dynamic_gain_xy_imu)
 
         # Iterate over the 3 spatial modules
         # Scale velocity injection by dt/DT so bump displacement matches real elapsed time,
@@ -403,16 +422,26 @@ class PoseCANN:
             
             # Density scaling: Smaller wrap scales mean the bump must traverse neurons faster!
             density_factor = c_size / scale 
-            scaled_vel_x = V_map_x * density_factor * vel_time_scale
-            scaled_vel_y = V_map_y * density_factor * vel_time_scale
+            
+            # IMU Current Component
+            scaled_vel_x_imu = V_map_x_imu * density_factor * vel_time_scale
+            scaled_vel_y_imu = V_map_y_imu * density_factor * vel_time_scale
+            I_vel_x_imu = dynamic_gain_xy_imu[:, None] * jnp.einsum('ij,bj->bi', self.W_cann_asym_x_list[i], r_flat) * scaled_vel_x_imu[:, None]
+            I_vel_y_imu = dynamic_gain_xy_imu[:, None] * jnp.einsum('ij,bj->bi', self.W_cann_asym_y_list[i], r_flat) * scaled_vel_y_imu[:, None]
 
-            I_vel_x = dynamic_gain_xy[:, None] * jnp.einsum('ij,bj->bi', self.W_cann_asym_x_list[i], r_flat) * scaled_vel_x[:, None]
-            I_vel_y = dynamic_gain_xy[:, None] * jnp.einsum('ij,bj->bi', self.W_cann_asym_y_list[i], r_flat) * scaled_vel_y[:, None]
+            # Vision Current Component
+            scaled_vel_x_vis = V_map_x_vis * density_factor * vel_time_scale
+            scaled_vel_y_vis = V_map_y_vis * density_factor * vel_time_scale
+            I_vel_x_vis = dynamic_gain_xy_vis[:, None] * jnp.einsum('ij,bj->bi', self.W_cann_asym_x_list[i], r_flat) * scaled_vel_x_vis[:, None]
+            I_vel_y_vis = dynamic_gain_xy_vis[:, None] * jnp.einsum('ij,bj->bi', self.W_cann_asym_y_list[i], r_flat) * scaled_vel_y_vis[:, None]
+
+            # Biophysical Summation
+            I_total_spatial = (I_vel_x_imu + I_vel_y_imu) + (I_vel_x_vis + I_vel_y_vis)
 
             u_flat = self._u_canns[i].reshape(B, -1)
             u_new = neural_field_update(
                 u_flat, r_flat + 1e-8, self.W_cann_list[i],
-                I_vel_x + I_vel_y, 
+                I_total_spatial, 
                 dt=DT, tau=TAU_U
             )
 
@@ -427,7 +456,19 @@ class PoseCANN:
             self._r_canns[i] = (r_raw / global_inhibition) * baseline_inhibition
 
         # ---- Ring: angular velocity injection ----
-        I_vel_raw = -dynamic_gain_th[:, None] * omega_filtered[:, None] * vel_time_scale * jnp.einsum('ij,bj->bi', self.W_ring_asym, self._r_ring)
+        spikes_th_imu = self.vel_coder_th(jnp.abs(omega_imu_filtered))
+        dynamic_gain_th_imu = jnp.sum(spikes_th_imu * self.W_cereb_th_imu, axis=1)
+        I_vel_raw_imu = -dynamic_gain_th_imu[:, None] * omega_imu_filtered[:, None] * vel_time_scale * jnp.einsum('ij,bj->bi', self.W_ring_asym, self._r_ring)
+
+        if omega_vis is not None and vis_trust is not None:
+            omega_vis_weighted = vis_trust * omega_vis
+            spikes_th_vis = self.vel_coder_th(jnp.abs(omega_vis_weighted))
+            dynamic_gain_th_vis = jnp.sum(spikes_th_vis * self.W_cereb_th_vis, axis=1)
+            I_vel_raw_vis = -dynamic_gain_th_vis[:, None] * omega_vis_weighted[:, None] * vel_time_scale * jnp.einsum('ij,bj->bi', self.W_ring_asym, self._r_ring)
+        else:
+            I_vel_raw_vis = 0.0
+
+        I_vel_raw = I_vel_raw_imu + I_vel_raw_vis
         I_vel_smooth = (jnp.roll(I_vel_raw, 1, axis=1) + I_vel_raw + jnp.roll(I_vel_raw, -1, axis=1)) / 3.0
 
         I_ext = I_vel_smooth
@@ -465,16 +506,21 @@ class PoseCANN:
 
         return jnp.concatenate([dummy_pos, th], axis=1)
 
-    def update_cerebellum(self, kin_t, pose_xy, current_heading, dt=DT):
+    def update_cerebellum(self, kin_t, pose_xy, current_heading, omega_vis=None, vis_trust=None, v_vis_trans=None, dt=DT):
         # 🌟 BULLETPROOF INIT: Check if the lagged variables exist yet!
         # This catches cases where initialize_pose() pre-filled prev_pose_xy.
         if getattr(self, 'lagged_v_imu', None) is None or self.prev_pose_xy is None:
             self.prev_pose_xy = pose_xy
             self.prev_heading = current_heading
             
-            # Prime the low-pass IMU target filters safely on the first frame
+            # Prime the low-pass target filters safely on the first frame
             self.lagged_v_imu = kin_t[:, 0]
+            self.lagged_v_vis = v_vis_trans[:, 0] if v_vis_trans is not None else jnp.zeros_like(kin_t[:, 0])
             self.lagged_w_imu = kin_t[:, 2]
+            if omega_vis is not None and vis_trust is not None:
+                self.lagged_w_vis = vis_trust * omega_vis
+            else:
+                self.lagged_w_vis = jnp.zeros_like(kin_t[:, 2])
             return
 
         v_bump_x = (pose_xy[:, 0] - self.prev_pose_xy[:, 0]) / dt
@@ -489,39 +535,59 @@ class PoseCANN:
         v_imu_forward = kin_t[:, 0]
         v_imu_omega = kin_t[:, 2]
 
-        # 🌟 Apply Neural Inertia (Low-Pass) to the IMU Targets
+        v_vis_forward = v_vis_trans[:, 0] if v_vis_trans is not None else jnp.zeros_like(kin_t[:, 0])
+        if omega_vis is not None and vis_trust is not None:
+            v_vis_omega = vis_trust * omega_vis
+        else:
+            v_vis_omega = jnp.zeros_like(kin_t[:, 2])
+
+        # 🌟 Apply Neural Inertia (Low-Pass) to the Targets
         decay_xy = jnp.exp(-dt / TAU_U)
         decay_th = jnp.exp(-dt / RING_TAU_U)
         
-        self.lagged_v_imu = decay_xy * self.lagged_v_imu + (1 - decay_xy) * v_imu_forward
-        self.lagged_w_imu = decay_th * self.lagged_w_imu + (1 - decay_th) * v_imu_omega
+        self.lagged_v_imu = decay_xy * self.lagged_v_imu + (1.0 - decay_xy) * v_imu_forward
+        self.lagged_v_vis = decay_xy * self.lagged_v_vis + (1.0 - decay_xy) * v_vis_forward
+        self.lagged_w_imu = decay_th * self.lagged_w_imu + (1.0 - decay_th) * v_imu_omega
+        self.lagged_w_vis = decay_th * self.lagged_w_vis + (1.0 - decay_th) * v_vis_omega
 
-        # Calculate Error (Comparing Apples to Apples!)
-        error_forward = jnp.clip(self.lagged_v_imu - v_bump_forward, -3.0, 3.0)
-        error_omega = jnp.clip(self.lagged_w_imu - v_bump_omega, -3.0, 3.0)
+        # Calculate Error (Comparing against the true IMU kinematic reference to prevent tug-of-war)
+        error_forward_imu = jnp.clip(self.lagged_v_imu - v_bump_forward, -3.0, 3.0)
+        error_forward_vis = jnp.clip(self.lagged_v_imu - v_bump_forward, -3.0, 3.0)
+        error_omega_imu = jnp.clip(self.lagged_w_imu - v_bump_omega, -3.0, 3.0)
+        error_omega_vis = jnp.clip(self.lagged_w_imu - v_bump_omega, -3.0, 3.0)
 
         v_imu_mag = jnp.sqrt(kin_t[:, 0]**2 + kin_t[:, 1]**2)
-        speed_spikes_xy = self.vel_coder_xy(v_imu_mag)
-        speed_spikes_th = self.vel_coder_th(jnp.abs(v_imu_omega))
+        v_vis_mag = jnp.sqrt(v_vis_forward**2 + (v_vis_trans[:, 1]**2 if v_vis_trans is not None else 0.0) + 1e-8)
+        
+        speed_spikes_xy_imu = self.vel_coder_xy(v_imu_mag)
+        speed_spikes_xy_vis = self.vel_coder_xy(v_vis_mag)
+        speed_spikes_th_imu = self.vel_coder_th(jnp.abs(v_imu_omega))
+        speed_spikes_th_vis = self.vel_coder_th(jnp.abs(v_vis_omega))
 
-        base_eta_xy = 0.1  # Set learning rate to 0.1
-        base_eta_th = 0.15  # Set learning rate to 0.15
-
-
+        base_eta_xy = 0.05  # Set learning rate to 0.05
+        base_eta_th = 0.08  # Set learning rate to 0.08
         
         # Soften the adrenaline so it amplifies without exploding
-        adrenaline_xy = 1.0 + 1.0 * jnp.abs(error_forward[:, None])
-        adrenaline_th = 1.0 + 1.0 * jnp.abs(error_omega[:, None])
+        adrenaline_xy_imu = 1.0 + 1.0 * jnp.abs(error_forward_imu[:, None])
+        adrenaline_xy_vis = 1.0 + 1.0 * jnp.abs(error_forward_vis[:, None])
+        adrenaline_th_imu = 1.0 + 1.0 * jnp.abs(error_omega_imu[:, None])
+        adrenaline_th_vis = 1.0 + 1.0 * jnp.abs(error_omega_vis[:, None])
 
-        dynamic_eta_xy = base_eta_xy * adrenaline_xy
-        dynamic_eta_th = base_eta_th * adrenaline_th
+        dynamic_eta_xy_imu = base_eta_xy * adrenaline_xy_imu
+        dynamic_eta_xy_vis = base_eta_xy * adrenaline_xy_vis
+        dynamic_eta_th_imu = base_eta_th * adrenaline_th_imu
+        dynamic_eta_th_vis = base_eta_th * adrenaline_th_vis
         
-        delta_W_xy = dynamic_eta_xy * error_forward[:, None] * jnp.sign(v_imu_forward)[:, None] * speed_spikes_xy
-        delta_W_th = dynamic_eta_th * error_omega[:, None] * jnp.sign(v_imu_omega)[:, None] * speed_spikes_th
+        delta_W_xy_imu = dynamic_eta_xy_imu * error_forward_imu[:, None] * jnp.sign(self.lagged_v_imu)[:, None] * speed_spikes_xy_imu
+        delta_W_xy_vis = dynamic_eta_xy_vis * error_forward_vis[:, None] * jnp.sign(self.lagged_v_vis)[:, None] * speed_spikes_xy_vis
+        
+        delta_W_th_imu = dynamic_eta_th_imu * error_omega_imu[:, None] * jnp.sign(self.lagged_w_imu)[:, None] * speed_spikes_th_imu
+        delta_W_th_vis = dynamic_eta_th_vis * error_omega_vis[:, None] * jnp.sign(self.lagged_w_vis)[:, None] * speed_spikes_th_vis
 
-        self.W_cereb_xy = jnp.clip(self.W_cereb_xy + delta_W_xy, 0.036, 1.0)   # Allows correct gain scaling in 2m room
-        self.W_cereb_th = jnp.clip(self.W_cereb_th + delta_W_th, 0.20,  0.80)  # Raised max heading gain to 0.80, min to 0.20
-
+        self.W_cereb_xy_imu = jnp.clip(self.W_cereb_xy_imu + delta_W_xy_imu, 0.01, 1.0)
+        self.W_cereb_xy_vis = jnp.clip(self.W_cereb_xy_vis + delta_W_xy_vis, 0.01, 1.0)
+        self.W_cereb_th_imu = jnp.clip(self.W_cereb_th_imu + delta_W_th_imu, 0.20,  0.80)
+        self.W_cereb_th_vis = jnp.clip(self.W_cereb_th_vis + delta_W_th_vis, 0.20,  0.80)
 
         self.prev_pose_xy = pose_xy
         self.prev_heading = current_heading
