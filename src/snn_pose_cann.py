@@ -76,7 +76,7 @@ V_TH = 1.0
 # The product (V_map_x * density_factor) is actually 2x smaller than before.
 # Therefore, we need to INCREASE the gain (0.10 → 0.15) and allow it to learn higher.
 VEL_GAIN_XY = 0.035     # velocity → bump shift (1:1 bump speed matching)
-VEL_GAIN_TH = 0.035     # omega → ring shift (lower gain to 0.035 to prevent overshoot)
+VEL_GAIN_TH = 0.157     # omega → ring shift (approx 1:1 bump speed matching)
 
 
 
