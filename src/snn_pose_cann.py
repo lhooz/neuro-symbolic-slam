@@ -63,7 +63,7 @@ RING_A_EXC = 1.0        # excitatory amplitude
 RING_A_INH = 0.50       # inhibitory amplitude (Mexican Hat)
 RING_SIGMA_EXC = 2.0    # excitatory spread (neuron units)
 RING_SIGMA_INH = 4.0    # inhibitory spread (neuron units)
-RING_TAU_U = 0.03
+RING_TAU_U = 0.01
 
 # Spiking LIF
 BETA_LIF = 0.85
