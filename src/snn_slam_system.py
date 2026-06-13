@@ -547,6 +547,15 @@ class SNNSLAMSystem:
         self.prev_decoded_xy = None   # one step earlier — used for linear extrapolation
         self.prev_time_surface = None # previous event time surface for visual odometry
 
+        # Configurable parameters for sensory pre-processing and fusion (Optimized Set)
+        self.v_x_scale = 0.25760
+        self.v_z_scale = 0.85133
+        self.psr_thresh = 4.72274
+        self.psr_range = 2.10938
+        self.vis_act_thresh = 0.06661
+        self.alpha_fuse = 0.00200
+        self.alpha_acc = 0.32071
+
     def reset(self, B):
         self.vision_state = self.vision.init_state(B)
         self.place_state = self.place.init_state(B)
@@ -643,8 +652,8 @@ class SNNSLAMSystem:
             omega_vis = jnp.clip(sub_pixel_th / dt, -6.0, 6.0)
             
             # Calculate dynamic blending weight based on PSR confidence
-            vis_trust_raw = jnp.clip((psr - 4.0) / 4.0, 0.0, 1.0)
-            vis_trust = jnp.where(vis_act >= 0.08, vis_trust_raw, 0.0)
+            vis_trust_raw = jnp.clip((psr - self.psr_thresh) / self.psr_range, 0.0, 1.0)
+            vis_trust = jnp.where(vis_act >= self.vis_act_thresh, vis_trust_raw, 0.0)
         else:
             omega_vis = jnp.zeros((B,))
             vis_trust = jnp.zeros((B,))
@@ -662,8 +671,8 @@ class SNNSLAMSystem:
             d_left = tof_t[:, 0]
             d_right = tof_t[:, 2]
             
-            v_x_vis = 0.14 * (F_left * d_left + F_right * d_right)
-            v_z_vis = 1.00 * jnp.abs(F_left * d_left - F_right * d_right)
+            v_x_vis = self.v_x_scale * (F_left * d_left + F_right * d_right)
+            v_z_vis = self.v_z_scale * jnp.abs(F_left * d_left - F_right * d_right)
             
             # Sign the visual velocities according to the IMU velocities to prevent opposite-current conflicts!
             v_x_vis = jnp.sign(kin_t[:, 0]) * v_x_vis
@@ -756,7 +765,7 @@ class SNNSLAMSystem:
         # Complementary Filter state estimator for gravity direction (pitch correction)
         if acc_t is not None:
             # 1. Low-pass filter the accelerometer readings (EMA) to suppress high-frequency flapping vibration
-            alpha_acc = 0.1
+            alpha_acc = self.alpha_acc
             if self._smooth_acc is None or self._smooth_acc.shape[0] != acc_t.shape[0]:
                 self._smooth_acc = acc_t
             else:
@@ -774,7 +783,7 @@ class SNNSLAMSystem:
             theta_gyro = wrap_angle(theta_gyro)
             
             # 4. Fuse using Complementary Filter
-            alpha_fuse = 0.015
+            alpha_fuse = self.alpha_fuse
             diff = wrap_angle(theta_accel - theta_gyro)
             self._theta_gravity = wrap_angle(theta_gyro + alpha_fuse * diff)
             

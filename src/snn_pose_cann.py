@@ -75,8 +75,8 @@ V_TH = 1.0
 # New  2m room: WRAP_SCALES[0]=0.6, slam_scale=1.0  → density_factor=18.3, V_map_x is 10x smaller.
 # The product (V_map_x * density_factor) is actually 2x smaller than before.
 # Therefore, we need to INCREASE the gain (0.10 → 0.15) and allow it to learn higher.
-VEL_GAIN_XY = 0.035     # velocity → bump shift (1:1 bump speed matching)
-VEL_GAIN_TH = 0.35     # omega → ring shift (approx 1:1 bump speed matching)
+VEL_GAIN_XY = 0.035     # velocity → bump shift (calibrated for 2m room)
+VEL_GAIN_TH = 0.35     # omega → ring shift (calibrated for 2m room)
 
 
 
@@ -266,6 +266,24 @@ class PoseCANN:
         self.prev_pose_xy = None
         self.prev_heading = None
 
+        # Hyperparameters for current injection & neuromorphic sensor fusion (Optimized Set)
+        self.VEL_GAIN_XY = 0.02399
+        self.VEL_GAIN_TH = 0.47942
+        self.alpha_gyro = 0.92236
+        self.k_global_cann = 0.05562
+        self.k_global_cann_scale = 8.94590
+        self.K_GRAVITY = 3.49460
+        self.SIGMA_GRAVITY = 0.10000
+        self.k_global_ring = 0.10921
+        self.k_global_ring_scale = 10.02164
+        self.base_eta_xy = 0.08185
+        self.base_eta_th = 0.18598
+        self.adrenaline_factor = 0.55575
+        self.clip_xy_min = 0.00873
+        self.clip_xy_max = 1.17463
+        self.clip_th_min = 0.13346
+        self.clip_th_max = 0.85424
+
     def reset(self, B):
         """Reset to centered Gaussian bumps (fallback initialization)."""
         self.prev_pose_xy = None
@@ -297,13 +315,13 @@ class PoseCANN:
         self._r_ring = jnp.clip(self._u_ring, 0, 1.0)
         
         if getattr(self, 'W_cereb_xy_imu', None) is None or self.W_cereb_xy_imu.shape[0] != B:
-            self.W_cereb_xy_imu = jnp.ones((B, self.n_speed_neurons)) * VEL_GAIN_XY
+            self.W_cereb_xy_imu = jnp.ones((B, self.n_speed_neurons)) * self.VEL_GAIN_XY
         if getattr(self, 'W_cereb_xy_vis', None) is None or self.W_cereb_xy_vis.shape[0] != B:
-            self.W_cereb_xy_vis = jnp.ones((B, self.n_speed_neurons)) * VEL_GAIN_XY
+            self.W_cereb_xy_vis = jnp.ones((B, self.n_speed_neurons)) * self.VEL_GAIN_XY
         if getattr(self, 'W_cereb_th_imu', None) is None or self.W_cereb_th_imu.shape[0] != B:
-            self.W_cereb_th_imu = jnp.ones((B, self.n_speed_neurons)) * VEL_GAIN_TH
+            self.W_cereb_th_imu = jnp.ones((B, self.n_speed_neurons)) * self.VEL_GAIN_TH
         if getattr(self, 'W_cereb_th_vis', None) is None or self.W_cereb_th_vis.shape[0] != B:
-            self.W_cereb_th_vis = jnp.ones((B, self.n_speed_neurons)) * VEL_GAIN_TH
+            self.W_cereb_th_vis = jnp.ones((B, self.n_speed_neurons)) * self.VEL_GAIN_TH
         
         self.prev_pose_xy = None
         self.prev_heading = None
@@ -369,7 +387,7 @@ class PoseCANN:
         # to filter out high-frequency (115Hz) sinusoidal wingbeat vibrations.
         # At 50Hz CANN update rate, alpha=0.85 corresponds to a time constant of ~10ms,
         # which effectively dampens wingbeat wobble while preserving intentional turns.
-        alpha = 0.85
+        alpha = self.alpha_gyro
         if self._smooth_omega is None or self._smooth_omega.shape[0] != B:
             self._smooth_omega = omega_imu
         else:
@@ -448,11 +466,11 @@ class PoseCANN:
             self._u_canns[i] = u_new.reshape(B, c_size, c_size)
 
             # Global Divisive Normalization for this specific module
-            k_global_cann = 0.05
+            k_global_cann = self.k_global_cann
             r_raw = jnp.maximum(0.0, self._u_canns[i])
             raw_sum = r_raw.sum(axis=(1, 2), keepdims=True)
             global_inhibition = 1.0 + k_global_cann * raw_sum 
-            baseline_inhibition = 1.0 + k_global_cann * 10.0 
+            baseline_inhibition = 1.0 + k_global_cann * self.k_global_cann_scale
             self._r_canns[i] = (r_raw / global_inhibition) * baseline_inhibition
 
         # ---- Ring: angular velocity injection ----
@@ -478,8 +496,8 @@ class PoseCANN:
             diff = angles[None, :] - theta_gravity[:, None]
             diff_wrapped = jnp.mod(diff + jnp.pi, 2 * jnp.pi) - jnp.pi
             
-            K_GRAVITY = 5.00
-            SIGMA_GRAVITY = 0.25
+            K_GRAVITY = self.K_GRAVITY
+            SIGMA_GRAVITY = self.SIGMA_GRAVITY
             I_gravity = K_GRAVITY * jnp.exp(- (diff_wrapped ** 2) / (2.0 * (SIGMA_GRAVITY ** 2)))
             I_ext = I_ext + I_gravity
 
@@ -492,11 +510,11 @@ class PoseCANN:
         self._u_ring = u_ring_new
 
         # === REPAIRED GLOBAL DIVISIVE NORMALIZATION FOR RING ===
-        k_global_ring = 0.1
+        k_global_ring = self.k_global_ring
         r_ring_raw = jnp.maximum(0.0, self._u_ring)
         ring_sum = r_ring_raw.sum(axis=1, keepdims=True)
         global_inhibition_ring = 1.0 + k_global_ring * ring_sum 
-        baseline_ring_inh = 1.0 + k_global_ring * 6.0
+        baseline_ring_inh = 1.0 + k_global_ring * self.k_global_ring_scale
         self._r_ring = (r_ring_raw / global_inhibition_ring) * baseline_ring_inh
 
         # ---- Readout ----
@@ -563,15 +581,15 @@ class PoseCANN:
         speed_spikes_xy_vis = self.vel_coder_xy(v_vis_mag)
         speed_spikes_th_imu = self.vel_coder_th(jnp.abs(v_imu_omega))
         speed_spikes_th_vis = self.vel_coder_th(jnp.abs(v_vis_omega))
-
-        base_eta_xy = 0.05  # Set learning rate to 0.05
-        base_eta_th = 0.08  # Set learning rate to 0.08
+        
+        base_eta_xy = self.base_eta_xy
+        base_eta_th = self.base_eta_th
         
         # Soften the adrenaline so it amplifies without exploding
-        adrenaline_xy_imu = 1.0 + 1.0 * jnp.abs(error_forward_imu[:, None])
-        adrenaline_xy_vis = 1.0 + 1.0 * jnp.abs(error_forward_vis[:, None])
-        adrenaline_th_imu = 1.0 + 1.0 * jnp.abs(error_omega_imu[:, None])
-        adrenaline_th_vis = 1.0 + 1.0 * jnp.abs(error_omega_vis[:, None])
+        adrenaline_xy_imu = 1.0 + self.adrenaline_factor * jnp.abs(error_forward_imu[:, None])
+        adrenaline_xy_vis = 1.0 + self.adrenaline_factor * jnp.abs(error_forward_vis[:, None])
+        adrenaline_th_imu = 1.0 + self.adrenaline_factor * jnp.abs(error_omega_imu[:, None])
+        adrenaline_th_vis = 1.0 + self.adrenaline_factor * jnp.abs(error_omega_vis[:, None])
 
         dynamic_eta_xy_imu = base_eta_xy * adrenaline_xy_imu
         dynamic_eta_xy_vis = base_eta_xy * adrenaline_xy_vis
@@ -584,10 +602,10 @@ class PoseCANN:
         delta_W_th_imu = dynamic_eta_th_imu * error_omega_imu[:, None] * jnp.sign(self.lagged_w_imu)[:, None] * speed_spikes_th_imu
         delta_W_th_vis = dynamic_eta_th_vis * error_omega_vis[:, None] * jnp.sign(self.lagged_w_vis)[:, None] * speed_spikes_th_vis
 
-        self.W_cereb_xy_imu = jnp.clip(self.W_cereb_xy_imu + delta_W_xy_imu, 0.01, 1.0)
-        self.W_cereb_xy_vis = jnp.clip(self.W_cereb_xy_vis + delta_W_xy_vis, 0.01, 1.0)
-        self.W_cereb_th_imu = jnp.clip(self.W_cereb_th_imu + delta_W_th_imu, 0.20,  0.80)
-        self.W_cereb_th_vis = jnp.clip(self.W_cereb_th_vis + delta_W_th_vis, 0.20,  0.80)
+        self.W_cereb_xy_imu = jnp.clip(self.W_cereb_xy_imu + delta_W_xy_imu, self.clip_xy_min, self.clip_xy_max)
+        self.W_cereb_xy_vis = jnp.clip(self.W_cereb_xy_vis + delta_W_xy_vis, self.clip_xy_min, self.clip_xy_max)
+        self.W_cereb_th_imu = jnp.clip(self.W_cereb_th_imu + delta_W_th_imu, self.clip_th_min, self.clip_th_max)
+        self.W_cereb_th_vis = jnp.clip(self.W_cereb_th_vis + delta_W_th_vis, self.clip_th_min, self.clip_th_max)
 
         self.prev_pose_xy = pose_xy
         self.prev_heading = current_heading
