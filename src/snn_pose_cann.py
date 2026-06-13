@@ -519,7 +519,7 @@ class PoseCANN:
         delta_W_xy = dynamic_eta_xy * error_forward[:, None] * jnp.sign(v_imu_forward)[:, None] * speed_spikes_xy
         delta_W_th = dynamic_eta_th * error_omega[:, None] * jnp.sign(v_imu_omega)[:, None] * speed_spikes_th
 
-        self.W_cereb_xy = jnp.clip(self.W_cereb_xy + delta_W_xy, 0.001, 1.0)   # Allows correct gain scaling in 2m room
+        self.W_cereb_xy = jnp.clip(self.W_cereb_xy + delta_W_xy, 0.036, 1.0)   # Allows correct gain scaling in 2m room
         self.W_cereb_th = jnp.clip(self.W_cereb_th + delta_W_th, 0.20,  0.80)  # Raised max heading gain to 0.80, min to 0.20
 
 
