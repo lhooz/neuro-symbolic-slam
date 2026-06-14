@@ -267,22 +267,24 @@ class PoseCANN:
         self.prev_heading = None
 
         # Hyperparameters for current injection & neuromorphic sensor fusion (Optimized Set)
-        self.VEL_GAIN_XY = 0.02399
-        self.VEL_GAIN_TH = 0.47942
-        self.alpha_gyro = 0.92236
-        self.k_global_cann = 0.05562
-        self.k_global_cann_scale = 8.94590
-        self.K_GRAVITY = 3.49460
-        self.SIGMA_GRAVITY = 0.10000
-        self.k_global_ring = 0.10921
-        self.k_global_ring_scale = 10.02164
-        self.base_eta_xy = 0.08185
-        self.base_eta_th = 0.18598
-        self.adrenaline_factor = 0.55575
-        self.clip_xy_min = 0.00873
-        self.clip_xy_max = 1.17463
-        self.clip_th_min = 0.13346
-        self.clip_th_max = 0.85424
+        self.VEL_GAIN_XY = 0.02845
+        self.VEL_GAIN_TH = 0.23930
+        self.alpha_gyro = 0.82194
+        self.k_global_cann = 0.03887
+        self.k_global_cann_scale = 7.88572
+        self.K_GRAVITY = 5.13428
+        self.SIGMA_GRAVITY = 0.09690
+        self.k_global_ring = 0.12593
+        self.k_global_ring_scale = 8.03417
+        self.base_eta_xy = 0.11625
+        self.base_eta_th = 0.08000
+        self.adrenaline_factor = 1.53858
+        self.clip_xy_min = 0.02098
+        self.clip_xy_max = 0.84906
+        self.clip_th_min = 0.18472
+        self.clip_th_max = 0.92626
+        self.TAU_U = 0.03759
+        self.RING_TAU_U = 0.02071
 
     def reset(self, B):
         """Reset to centered Gaussian bumps (fallback initialization)."""
@@ -398,7 +400,7 @@ class PoseCANN:
         theta_current = ring_readout(self._r_ring)
         
         # 🌟 THE UPGRADE: Apply a Predictive Phase Lead to cancel Leaky Integrator lag!
-        predictive_lead = omega_imu_filtered * RING_TAU_U 
+        predictive_lead = omega_imu_filtered * self.RING_TAU_U 
         theta_compensated = theta_current + predictive_lead
         
         # 2nd-Order Midpoint Integration on the COMPENSATED heading
@@ -460,7 +462,7 @@ class PoseCANN:
             u_new = neural_field_update(
                 u_flat, r_flat + 1e-8, self.W_cann_list[i],
                 I_total_spatial, 
-                dt=DT, tau=TAU_U
+                dt=DT, tau=self.TAU_U
             )
 
             self._u_canns[i] = u_new.reshape(B, c_size, c_size)
@@ -504,7 +506,7 @@ class PoseCANN:
         u_ring_new = neural_field_update(
             self._u_ring, self._r_ring + 1e-8, self.W_ring,
             I_ext, 
-            dt=DT, tau=RING_TAU_U
+            dt=DT, tau=self.RING_TAU_U
         )
 
         self._u_ring = u_ring_new
@@ -560,8 +562,8 @@ class PoseCANN:
             v_vis_omega = jnp.zeros_like(kin_t[:, 2])
 
         # 🌟 Apply Neural Inertia (Low-Pass) to the Targets
-        decay_xy = jnp.exp(-dt / TAU_U)
-        decay_th = jnp.exp(-dt / RING_TAU_U)
+        decay_xy = jnp.exp(-dt / self.TAU_U)
+        decay_th = jnp.exp(-dt / self.RING_TAU_U)
         
         self.lagged_v_imu = decay_xy * self.lagged_v_imu + (1.0 - decay_xy) * v_imu_forward
         self.lagged_v_vis = decay_xy * self.lagged_v_vis + (1.0 - decay_xy) * v_vis_forward
