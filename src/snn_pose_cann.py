@@ -267,24 +267,24 @@ class PoseCANN:
         self.prev_heading = None
 
         # Hyperparameters for current injection & neuromorphic sensor fusion (Optimized Set)
-        self.VEL_GAIN_XY = 0.02845
-        self.VEL_GAIN_TH = 0.23930
-        self.alpha_gyro = 0.82194
-        self.k_global_cann = 0.03887
-        self.k_global_cann_scale = 7.88572
-        self.K_GRAVITY = 5.13428
-        self.SIGMA_GRAVITY = 0.09690
-        self.k_global_ring = 0.12593
-        self.k_global_ring_scale = 8.03417
-        self.base_eta_xy = 0.11625
-        self.base_eta_th = 0.08000
-        self.adrenaline_factor = 1.53858
-        self.clip_xy_min = 0.02098
-        self.clip_xy_max = 0.84906
-        self.clip_th_min = 0.18472
-        self.clip_th_max = 0.92626
-        self.TAU_U = 0.03759
-        self.RING_TAU_U = 0.02071
+        self.VEL_GAIN_XY = 0.05127
+        self.VEL_GAIN_TH = 0.16472
+        self.alpha_gyro = 0.86862
+        self.k_global_cann = 0.04744
+        self.k_global_cann_scale = 5.27470
+        self.K_GRAVITY = 2.88678
+        self.SIGMA_GRAVITY = 0.05414
+        self.k_global_ring = 0.07257
+        self.k_global_ring_scale = 12.00000
+        self.base_eta_xy = 0.13791
+        self.base_eta_th = 0.20000
+        self.adrenaline_factor = 0.40581
+        self.clip_xy_min = 0.01161
+        self.clip_xy_max = 0.73772
+        self.clip_th_min = 0.08292
+        self.clip_th_max = 0.86788
+        self.TAU_U = 0.04587
+        self.RING_TAU_U = 0.00899
 
     def reset(self, B):
         """Reset to centered Gaussian bumps (fallback initialization)."""

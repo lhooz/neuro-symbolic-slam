@@ -548,13 +548,13 @@ class SNNSLAMSystem:
         self.prev_time_surface = None # previous event time surface for visual odometry
 
         # Configurable parameters for sensory pre-processing and fusion (Optimized Set)
-        self.v_x_scale = 0.15638
-        self.v_z_scale = 0.51419
-        self.psr_thresh = 4.91860
-        self.psr_range = 3.24478
-        self.vis_act_thresh = 0.03845
-        self.alpha_fuse = 0.00201
-        self.alpha_acc = 0.16819
+        self.v_x_scale = 0.01000
+        self.v_z_scale = 0.22070
+        self.psr_thresh = 4.49000
+        self.psr_range = 4.84275
+        self.vis_act_thresh = 0.01154
+        self.alpha_fuse = 0.00435
+        self.alpha_acc = 0.18630
 
     def reset(self, B):
         self.vision_state = self.vision.init_state(B)
