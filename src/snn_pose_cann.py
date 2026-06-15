@@ -285,6 +285,10 @@ class PoseCANN:
         self.clip_th_max = 0.86788
         self.TAU_U = 0.04587
         self.RING_TAU_U = 0.00899
+        # Integrated IMU Position Injection Hyperparameters
+        self.K_IMU_POS = 0.8
+        self.SIGMA_IMU_POS = 1.2
+        self.imu_integrated_xy = None
 
     def reset(self, B):
         """Reset to centered Gaussian bumps (fallback initialization)."""
@@ -293,6 +297,7 @@ class PoseCANN:
         self.lagged_v_imu = None
         self.lagged_w_imu = None
         self._smooth_omega = None
+        self.imu_integrated_xy = jnp.zeros((B, 2))
 
         # 1. Loop through all 3 modules to initialize their flat states
         for i, c_size in enumerate(CANN_SIZES):
@@ -334,6 +339,7 @@ class PoseCANN:
 
     def initialize_pose(self, gt_pos, gt_heading):
         B = gt_pos.shape[0]
+        self.imu_integrated_xy = gt_pos
         
         # 1. Initialize the 3 Grid Modules using Modulo Math
         for i, (c_size, scale) in enumerate(zip(CANN_SIZES, WRAP_SCALES)):
@@ -414,6 +420,9 @@ class PoseCANN:
         V_map_x_imu = vx_imu * cos_t_mid - vy_imu * sin_t_mid
         V_map_y_imu = vx_imu * sin_t_mid + vy_imu * cos_t_mid
 
+        # Update integrated position (metric reference)
+        self.imu_integrated_xy = self.imu_integrated_xy + jnp.stack([V_map_x_imu, V_map_y_imu], axis=-1) * dt
+
         v_mag_xy_imu = jnp.sqrt(V_map_x_imu**2 + V_map_y_imu**2)
         spikes_xy_imu = self.vel_coder_xy(v_mag_xy_imu)
         dynamic_gain_xy_imu = jnp.sum(spikes_xy_imu * self.W_cereb_xy_imu, axis=1)
@@ -455,8 +464,29 @@ class PoseCANN:
             I_vel_x_vis = dynamic_gain_xy_vis[:, None] * jnp.einsum('ij,bj->bi', self.W_cann_asym_x_list[i], r_flat) * scaled_vel_x_vis[:, None]
             I_vel_y_vis = dynamic_gain_xy_vis[:, None] * jnp.einsum('ij,bj->bi', self.W_cann_asym_y_list[i], r_flat) * scaled_vel_y_vis[:, None]
 
-            # Biophysical Summation
-            I_total_spatial = (I_vel_x_imu + I_vel_y_imu) + (I_vel_x_vis + I_vel_y_vis)
+            # 🌟 Symmetric Bump current injection based on Integrated IMU position (modulo wrap scale)
+            local_x = self.imu_integrated_xy[:, 0] % scale
+            local_y = self.imu_integrated_xy[:, 1] % scale
+            cx_float = (local_x / scale) * c_size
+            cy_float = (local_y / scale) * c_size
+
+            # Create module coordinate meshgrid
+            xx, yy = jnp.meshgrid(
+                jnp.arange(c_size, dtype=jnp.float32),
+                jnp.arange(c_size, dtype=jnp.float32),
+                indexing='xy'
+            )
+            cx_exp = cx_float[:, None, None]
+            cy_exp = cy_float[:, None, None]
+            dx = jnp.minimum(jnp.abs(xx[None, :, :] - cx_exp), c_size - jnp.abs(xx[None, :, :] - cx_exp))
+            dy = jnp.minimum(jnp.abs(yy[None, :, :] - cy_exp), c_size - jnp.abs(yy[None, :, :] - cy_exp))
+            d2 = dx**2 + dy**2
+
+            # Form Gaussian bump input
+            I_imu_pos = self.K_IMU_POS * jnp.exp(-d2 / (2 * self.SIGMA_IMU_POS**2))
+
+            # Biophysical Summation (add the integrated position injection)
+            I_total_spatial = (I_vel_x_imu + I_vel_y_imu) + (I_vel_x_vis + I_vel_y_vis) + I_imu_pos.reshape(B, -1)
 
             u_flat = self._u_canns[i].reshape(B, -1)
             u_new = neural_field_update(
