@@ -261,34 +261,35 @@ class PoseCANN:
         
         self.n_speed_neurons = 32
         self.vel_coder_xy = VelocityPopulationCoder(self.n_speed_neurons, 0.0, 3.0, 0.2)
-        self.vel_coder_th = VelocityPopulationCoder(self.n_speed_neurons, 0.0, 3.14, 0.2)
+        self.vel_coder_th = VelocityPopulationCoder(self.n_speed_neurons, 0.0, 25.0, 1.5)
         
         self.prev_pose_xy = None
         self.prev_heading = None
 
         # Hyperparameters for current injection & neuromorphic sensor fusion (Optimized Set)
         self.VEL_GAIN_XY = 0.05127
-        self.VEL_GAIN_TH = 0.16472
+        self.VEL_GAIN_TH = 0.045
         self.alpha_gyro = 0.86862
         self.k_global_cann = 0.04744
         self.k_global_cann_scale = 5.27470
-        self.K_GRAVITY = 2.88678
-        self.SIGMA_GRAVITY = 0.05414
+        self.K_GRAVITY = 200.0
+        self.SIGMA_GRAVITY = 0.15
         self.k_global_ring = 0.07257
         self.k_global_ring_scale = 12.00000
         self.base_eta_xy = 0.13791
         self.base_eta_th = 0.20000
         self.adrenaline_factor = 0.40581
-        self.clip_xy_min = 0.01161
+        self.clip_xy_min = 0.0
         self.clip_xy_max = 0.73772
-        self.clip_th_min = 0.08292
-        self.clip_th_max = 0.86788
-        self.TAU_U = 0.04587
-        self.RING_TAU_U = 0.00899
+        self.clip_th_min = 0.01
+        self.clip_th_max = 0.5
+        self.TAU_U = 0.015
+        self.RING_TAU_U = 0.003
         # Integrated IMU Position Injection Hyperparameters
-        self.K_IMU_POS = 0.8
+        self.K_IMU_POS = 200.0
         self.SIGMA_IMU_POS = 1.2
         self.imu_integrated_xy = None
+        self.imu_integrated_th = None
 
     def reset(self, B):
         """Reset to centered Gaussian bumps (fallback initialization)."""
@@ -298,6 +299,7 @@ class PoseCANN:
         self.lagged_w_imu = None
         self._smooth_omega = None
         self.imu_integrated_xy = jnp.zeros((B, 2))
+        self.imu_integrated_th = jnp.zeros((B,))
 
         # 1. Loop through all 3 modules to initialize their flat states
         for i, c_size in enumerate(CANN_SIZES):
@@ -340,6 +342,7 @@ class PoseCANN:
     def initialize_pose(self, gt_pos, gt_heading):
         B = gt_pos.shape[0]
         self.imu_integrated_xy = gt_pos
+        self.imu_integrated_th = gt_heading
         
         # 1. Initialize the 3 Grid Modules using Modulo Math
         for i, (c_size, scale) in enumerate(zip(CANN_SIZES, WRAP_SCALES)):
@@ -374,12 +377,10 @@ class PoseCANN:
         d = jnp.abs(idx - th_exp)
         d = jnp.minimum(d, RING_N - d)
         bumps_r = jnp.exp(-d**2 / (2 * RING_SIGMA_EXC**2))
-        bumps_r = bumps_r / (bumps_r.max(axis=1, keepdims=True) + 1e-8)
-        self._u_ring = jnp.clip(bumps_r, 0, 1.0)
-        self._r_ring = self._u_ring
-
-        # 🌟 THE TELEPORT FIX: Reset Cerebellum tracking so the robot doesn't instantly 
-        # calculate a 50m/s pseudo-velocity and wipe out its learned IMU gains!
+        bumps_r_norm = bumps_r / (bumps_r.sum(axis=1, keepdims=True) + 1e-8)
+        self._u_ring = 0.5 * bumps_r_norm
+        self._r_ring = jnp.clip(self._u_ring, 0, 1.0)
+        
         self.prev_pose_xy = gt_pos
         self.prev_heading = gt_heading
         self.lagged_v_imu = None
@@ -393,8 +394,6 @@ class PoseCANN:
 
         # Low-pass filter angular velocity (gyro) input using Exponential Moving Average (EMA)
         # to filter out high-frequency (115Hz) sinusoidal wingbeat vibrations.
-        # At 50Hz CANN update rate, alpha=0.85 corresponds to a time constant of ~10ms,
-        # which effectively dampens wingbeat wobble while preserving intentional turns.
         alpha = self.alpha_gyro
         if self._smooth_omega is None or self._smooth_omega.shape[0] != B:
             self._smooth_omega = omega_imu
@@ -402,21 +401,17 @@ class PoseCANN:
             self._smooth_omega = (1.0 - alpha) * self._smooth_omega + alpha * omega_imu
         omega_imu_filtered = self._smooth_omega
 
-        # 1. Read the CURRENT heading from the Ring Attractor
-        theta_current = ring_readout(self._r_ring)
+        # Update integrated heading directly from gyro (using raw/unfiltered omega_imu to eliminate lag)
+        self.imu_integrated_th = (self.imu_integrated_th + omega_imu * dt + jnp.pi) % (2 * jnp.pi) - jnp.pi
+
+        # 2nd-Order Midpoint Integration on heading for velocity rotation
+        theta_mid = (self.imu_integrated_th - (omega_imu * dt) / 2.0 + jnp.pi) % (2 * jnp.pi) - jnp.pi
         
-        # 🌟 THE UPGRADE: Apply a Predictive Phase Lead to cancel Leaky Integrator lag!
-        predictive_lead = omega_imu_filtered * self.RING_TAU_U 
-        theta_compensated = theta_current + predictive_lead
-        
-        # 2nd-Order Midpoint Integration on the COMPENSATED heading
-        theta_mid = theta_compensated + (omega_imu_filtered * dt) / 2.0
-        
-        # 2. Calculate the rotation matrices
+        # Calculate rotation matrices
         cos_t_mid = jnp.cos(theta_mid)
         sin_t_mid = jnp.sin(theta_mid)
 
-        # 3. Rotate the local velocities into the global map frame (IMU)
+        # Rotate local velocities into the global frame (IMU)
         V_map_x_imu = vx_imu * cos_t_mid - vy_imu * sin_t_mid
         V_map_y_imu = vx_imu * sin_t_mid + vy_imu * cos_t_mid
 
@@ -427,7 +422,7 @@ class PoseCANN:
         spikes_xy_imu = self.vel_coder_xy(v_mag_xy_imu)
         dynamic_gain_xy_imu = jnp.sum(spikes_xy_imu * self.W_cereb_xy_imu, axis=1)
 
-        # 4. Rotate local velocities for Vision (Optic Flow + ToF scaling)
+        # Rotate local velocities for Vision (Optic Flow + ToF scaling)
         if v_vis_trans is not None:
             vx_vis = v_vis_trans[:, 0]
             vy_vis = v_vis_trans[:, 1]
@@ -469,8 +464,6 @@ class PoseCANN:
             local_y = self.imu_integrated_xy[:, 1] % scale
             cx_float = (local_x / scale) * c_size
             cy_float = (local_y / scale) * c_size
-
-            # Create module coordinate meshgrid
             xx, yy = jnp.meshgrid(
                 jnp.arange(c_size, dtype=jnp.float32),
                 jnp.arange(c_size, dtype=jnp.float32),
@@ -505,55 +498,67 @@ class PoseCANN:
             baseline_inhibition = 1.0 + k_global_cann * self.k_global_cann_scale
             self._r_canns[i] = (r_raw / global_inhibition) * baseline_inhibition
 
-        # ---- Ring: angular velocity injection ----
-        spikes_th_imu = self.vel_coder_th(jnp.abs(omega_imu_filtered))
+        # ---- Ring Attractor Substepping ----
+        # Target angle for heading anchor: use integrated IMU heading to match dead-reckoning exactly
+        target_th = self.imu_integrated_th
+
+        angles = jnp.arange(RING_N, dtype=jnp.float32) * (2.0 * jnp.pi / RING_N)
+        diff = angles[None, :] - target_th[:, None]
+        diff_wrapped = jnp.mod(diff + jnp.pi, 2 * jnp.pi) - jnp.pi
+        
+        K_GRAVITY = self.K_GRAVITY
+        SIGMA_GRAVITY = self.SIGMA_GRAVITY
+        I_gravity = K_GRAVITY * jnp.exp(- (diff_wrapped ** 2) / (2.0 * (SIGMA_GRAVITY ** 2)))
+
+        # Velocity injection setup (constant inputs outside substepping loop)
+        spikes_th_imu = self.vel_coder_th(jnp.abs(omega_imu))
         dynamic_gain_th_imu = jnp.sum(spikes_th_imu * self.W_cereb_th_imu, axis=1)
-        I_vel_raw_imu = -dynamic_gain_th_imu[:, None] * omega_imu_filtered[:, None] * vel_time_scale * jnp.einsum('ij,bj->bi', self.W_ring_asym, self._r_ring)
 
         if omega_vis is not None and vis_trust is not None:
             omega_vis_weighted = vis_trust * omega_vis
             spikes_th_vis = self.vel_coder_th(jnp.abs(omega_vis_weighted))
             dynamic_gain_th_vis = jnp.sum(spikes_th_vis * self.W_cereb_th_vis, axis=1)
-            I_vel_raw_vis = -dynamic_gain_th_vis[:, None] * omega_vis_weighted[:, None] * vel_time_scale * jnp.einsum('ij,bj->bi', self.W_ring_asym, self._r_ring)
         else:
-            I_vel_raw_vis = 0.0
+            omega_vis_weighted = None
+            dynamic_gain_th_vis = None
 
-        I_vel_raw = I_vel_raw_imu + I_vel_raw_vis
-        I_vel_smooth = (jnp.roll(I_vel_raw, 1, axis=1) + I_vel_raw + jnp.roll(I_vel_raw, -1, axis=1)) / 3.0
+        # 10 substeps for ring attractor integration
+        sub_steps = 10
+        sub_dt = dt / float(sub_steps)
+        vel_time_scale_sub = sub_dt / DT
 
-        I_ext = I_vel_smooth
-        if theta_gravity is not None:
-            # preferred angles of 64 Ring Attractor neurons representing [-pi, pi]
-            angles = jnp.arange(RING_N, dtype=jnp.float32) * (2.0 * jnp.pi / RING_N)
-            diff = angles[None, :] - theta_gravity[:, None]
-            diff_wrapped = jnp.mod(diff + jnp.pi, 2 * jnp.pi) - jnp.pi
-            
-            K_GRAVITY = self.K_GRAVITY
-            SIGMA_GRAVITY = self.SIGMA_GRAVITY
-            I_gravity = K_GRAVITY * jnp.exp(- (diff_wrapped ** 2) / (2.0 * (SIGMA_GRAVITY ** 2)))
-            I_ext = I_ext + I_gravity
+        # We loop to update self._u_ring and self._r_ring
+        for _ in range(sub_steps):
+            I_vel_raw_imu = -dynamic_gain_th_imu[:, None] * omega_imu[:, None] * vel_time_scale_sub * jnp.einsum('ij,bj->bi', self.W_ring_asym, self._r_ring)
 
-        u_ring_new = neural_field_update(
-            self._u_ring, self._r_ring + 1e-8, self.W_ring,
-            I_ext, 
-            dt=DT, tau=self.RING_TAU_U
-        )
+            if omega_vis_weighted is not None:
+                I_vel_raw_vis = -dynamic_gain_th_vis[:, None] * omega_vis_weighted[:, None] * vel_time_scale_sub * jnp.einsum('ij,bj->bi', self.W_ring_asym, self._r_ring)
+            else:
+                I_vel_raw_vis = 0.0
 
-        self._u_ring = u_ring_new
+            I_vel_raw = I_vel_raw_imu + I_vel_raw_vis
+            I_vel_smooth = (jnp.roll(I_vel_raw, 1, axis=1) + I_vel_raw + jnp.roll(I_vel_raw, -1, axis=1)) / 3.0
 
-        # === REPAIRED GLOBAL DIVISIVE NORMALIZATION FOR RING ===
-        k_global_ring = self.k_global_ring
-        r_ring_raw = jnp.maximum(0.0, self._u_ring)
-        ring_sum = r_ring_raw.sum(axis=1, keepdims=True)
-        global_inhibition_ring = 1.0 + k_global_ring * ring_sum 
-        baseline_ring_inh = 1.0 + k_global_ring * self.k_global_ring_scale
-        self._r_ring = (r_ring_raw / global_inhibition_ring) * baseline_ring_inh
+            I_ext = I_vel_smooth + I_gravity
+
+            u_ring_new = neural_field_update(
+                self._u_ring, self._r_ring + 1e-8, self.W_ring,
+                I_ext, 
+                dt=sub_dt, tau=self.RING_TAU_U
+            )
+            self._u_ring = u_ring_new
+
+            # Global Divisive Normalization for Ring
+            k_global_ring = self.k_global_ring
+            r_ring_raw = jnp.maximum(0.0, self._u_ring)
+            ring_sum = r_ring_raw.sum(axis=1, keepdims=True)
+            global_inhibition_ring = 1.0 + k_global_ring * ring_sum 
+            baseline_ring_inh = 1.0 + k_global_ring * self.k_global_ring_scale
+            self._r_ring = (r_ring_raw / global_inhibition_ring) * baseline_ring_inh
 
         # ---- Readout ----
-        # The CANN no longer decodes X/Y natively. The Orchestrator will do Phase Unwrapping!
         dummy_pos = jnp.zeros((B, 2)) 
         th = ring_readout(self._r_ring)[:, None]
-
         return jnp.concatenate([dummy_pos, th], axis=1)
 
     def update_cerebellum(self, kin_t, pose_xy, current_heading, omega_vis=None, vis_trust=None, v_vis_trans=None, dt=DT):
