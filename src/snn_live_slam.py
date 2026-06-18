@@ -383,7 +383,10 @@ def run_live_slam(key):
             )
             
             # Update the Surprise Signal for the next frame
-            surprise = 1.0 - float(debug_gates['Raw_Match'][0])
+            raw_match = float(debug_gates['Raw_Match'][0])
+            conc_place = float(debug_gates['Conc_Place'][0])
+            composite_match = raw_match * conc_place
+            surprise = 1.0 - float(np.exp(-5.0 * (1.0 - composite_match)))
             
             cx, cy, cth = float(pose_cl[0, 0]), float(pose_cl[0, 1]), float(pose_cl[0, 2])
 
