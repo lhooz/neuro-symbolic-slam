@@ -283,8 +283,8 @@ class PoseCANN:
         self.clip_xy_max = 0.73772
         self.clip_th_min = 0.01
         self.clip_th_max = 0.5
-        self.TAU_U = 0.015
-        self.RING_TAU_U = 0.003
+        self.TAU_U = 0.005
+        self.RING_TAU_U = 0.001
         # Integrated IMU Position Injection Hyperparameters
         self.K_IMU_POS = 200.0
         self.SIGMA_IMU_POS = 1.2
