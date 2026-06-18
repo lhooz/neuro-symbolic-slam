@@ -241,17 +241,16 @@ class PlaceCellNetwork:
         tof_error = tof_features[:, None, :, None] - state.W_tof_to_ring
         dW_dr = flash_mask * tof_error
 
-        # 🌟 BUG FIX: Included STDP multiplication in current_energy to correctly scale the spatial match gate
-        current_energy = (jnp.sum(jnp.square(vis_csnn), axis=1) * jnp.sum(jnp.square(tof_features), axis=1)) * (1.0 + GATING_STRENGTH * jnp.sum(jnp.square(vis_stdp), axis=1))
+        # Novelty gate: is the best matching place cell capturing most of the energy?
+        all_place_energy = (jnp.einsum('bv,bvp->bp', vis_csnn, state.W_csnn_to_place) * 
+             jnp.einsum('bd,bdp->bp', tof_features, state.W_tof_to_place)) * \
+            (1.0 + GATING_STRENGTH * jnp.einsum('bs,bsp->bp', vis_stdp, state.W_stdp_to_place))
+        all_place_energy = jnp.maximum(0.0, all_place_energy)
+
+        best_mem_energy = jnp.max(all_place_energy, axis=1)
+        total_mem_energy = jnp.sum(all_place_energy, axis=1)
         
-        best_mem_energy = jnp.max(
-            (jnp.einsum('bv,bvp->bp', vis_csnn, state.W_csnn_to_place) * 
-             jnp.einsum('bd,bdp->bp', tof_features, state.W_tof_to_place)) * 
-            (1.0 + GATING_STRENGTH * jnp.einsum('bs,bsp->bp', vis_stdp, state.W_stdp_to_place)),
-            axis=1
-        )
-        
-        spatial_match_ratio = best_mem_energy / (current_energy + 1e-8)
+        spatial_match_ratio = best_mem_energy / (total_mem_energy + 1e-8)
         spatial_novelty_mask = jnp.where(spatial_match_ratio < 0.75, 1.0, 0.0)[:, None, None]
 
         # ---------------------------------------------------------
@@ -361,31 +360,28 @@ class PlaceCellNetwork:
         # 🌟 THE SURPRISE SIGNAL & RAW MATCH PIPELINE
         # =========================================================
         
-        # 0. Move Max Energy calculation to the top so we can use it for normalization
-        max_csnn = jnp.sum(jnp.square(vis_csnn), axis=1)
-        max_stdp = jnp.sum(jnp.square(vis_stdp), axis=1)
-        max_tof  = jnp.sum(jnp.square(tof_features), axis=1)
-        max_sensory_energy = (max_csnn * max_tof) * (1.0 + GATING_STRENGTH * max_stdp)
-
-        # 1. The Strict Expected Mask (Fix 1: Use live_barcode!)
+        # 1. The Strict Expected Mask
         expected_place_mask = live_barcode  
 
-        # 2. Use the RAW, un-exponentiated sensory voltages!
-        expected_raw_voltages = pure_sensory_place * expected_place_mask
+        # 2. Energy in the EXPECTED place cells (the k_spikes cells the
+        #    CANN believes should be active at the current pose).
+        expected_energy = jnp.sum(pure_sensory_place * expected_place_mask, axis=1)
+
+        # 3. Total energy across ALL place cells (the self-consistent
+        #    normalization denominator — same units as the numerator).
+        total_place_energy = jnp.sum(pure_sensory_place, axis=1)
+
+        # 4. Match score: fraction of total place-cell energy that falls
+        #    in the expected cells.  Bounded [0, 1], scale-invariant.
+        #    - Perfect recognition  → energy concentrated in expected cells → ~1.0
+        #    - Wrong location       → energy elsewhere                     → ~0.0
+        #    - No learned memories  → uniform noise → ~k_spikes/n_place    → ~0.06
+        match_score = jnp.minimum(expected_energy / (total_place_energy + 1e-8), 1.0)
         
-        # 3. Sum the raw energy of all 8 expected neurons
-        expected_energy_sum = jnp.sum(expected_raw_voltages, axis=1)
-        
-        # 4. Find the exact Mean energy of the expected population
-        mean_expected_energy = expected_energy_sum / self.k_spikes
-        
-        # 5. Normalize against the theoretical physical maximum (Fix 2: Order of operations)
-        match_score = jnp.minimum(mean_expected_energy / (max_sensory_energy + 1e-8), 1.0)
-        
-        # 6. The True Population Surprise Signal
+        # 5. The True Population Surprise Signal
         surprise_signal = 1.0 - match_score
         
-        # Backward compatibility for your debug UI (Fix 3: Removed double division!)
+        # Backward compatibility for debug UI
         recalled_place = match_score
 
         # 7. Distinctiveness Check
