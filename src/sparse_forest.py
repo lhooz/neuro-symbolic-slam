@@ -252,9 +252,14 @@ def _generate_surface_textures(obstacles, room_seed):
 
     return textures
 
-def compute_tof_distance(robot_pos, robot_heading, segments):
-    angles = robot_heading + jnp.array([-jnp.pi/4, 0.0, jnp.pi/4])
-    origins = jnp.broadcast_to(robot_pos, (3, 2))
+def compute_tof_distance(robot_pos, robot_heading, segments, include_back=False):
+    if include_back:
+        angles = robot_heading + jnp.array([-jnp.pi/4, 0.0, jnp.pi/4, jnp.pi])
+        n_rays = 4
+    else:
+        angles = robot_heading + jnp.array([-jnp.pi/4, 0.0, jnp.pi/4])
+        n_rays = 3
+    origins = jnp.broadcast_to(robot_pos, (n_rays, 2))
     directions = jnp.stack([jnp.cos(angles), jnp.sin(angles)], axis=-1)
 
     dists, _ = cast_rays(origins, directions, segments) 

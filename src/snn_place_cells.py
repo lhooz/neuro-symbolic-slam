@@ -89,13 +89,38 @@ class PlaceCellNetwork:
         
         self.fov_rad    = jnp.radians(fov_deg)
         self.pixel_ang_res = self.fov_rad / float(self.n_csnn) 
-        self.max_blur_pixels = 10.0
-        self.dt = 0.05 
+        self.max_blur_pixels = 15.0
+        self.dt = 0.0216 
         self.dynamic_saccade_thresh = (self.max_blur_pixels * self.pixel_ang_res) / self.dt
 
         self.ring_preferred_th  = build_ring_preferred_th()
 
-        self.W_dg = jax.random.normal(key, (self.n_pose, self.n_place))
+        # Initialize W_dg with spatially smooth grid-to-place projection weights
+        # to enforce wide, overlapping spatial receptive fields for place cells.
+        W_raw = jax.random.normal(key, (self.n_pose, self.n_place))
+        
+        sizes = [11, 13, 17]
+        starts = [0, 121, 121+169]
+        ends = [121, 121+169, 579]
+        SIGMA_SMOOTH = 1.8
+        
+        smoothed_parts = []
+        for s, e, sz in zip(starts, ends, sizes):
+            W_mod = W_raw[s:e, :] # (sz*sz, n_place)
+            grid = W_mod.reshape(sz, sz, self.n_place)
+            
+            # Create Gaussian convolution matrix C
+            diff = jnp.abs(jnp.arange(sz)[:, None] - jnp.arange(sz)[None, :])
+            C = jnp.exp(-diff**2 / (2.0 * SIGMA_SMOOTH**2))
+            C = C / jnp.sum(C, axis=1, keepdims=True)
+            
+            # Apply 2D separable Gaussian blur
+            grid_h = jnp.einsum('ik,kmp->imp', C, grid)
+            grid_v = jnp.einsum('jk,ikp->ijp', C, grid_h)
+            
+            smoothed_parts.append(grid_v.reshape(sz*sz, self.n_place))
+            
+        self.W_dg = jnp.concatenate(smoothed_parts, axis=0)
 
         k_vis_hash, key = random.split(key)
         self.W_vis_hash = jax.random.normal(k_vis_hash, (self.n_csnn, self.n_place))
@@ -176,7 +201,7 @@ class PlaceCellNetwork:
         return self(state, vis_csnn, vis_stdp, tof_features, pose_bump, ring_bump, heading=heading, angular_vel=angular_vel, learn=learn, confidence=confidence)
 
     def _updateHebbian(self, state: PlaceCellState, vis_csnn, vis_stdp, tof_features, pose_bump, ring_bump, heading, angular_vel=None, confidence=None):
-        ETA_W = 0.05
+        ETA_W = 0.20
         W_MAX = 1.0      # Only used by Hebbian Sequence memory
         LAMBDA_W = 0.001 # Only used by Hebbian Sequence memory
         # ASYMMETRIC INSTAR RULE
@@ -247,11 +272,23 @@ class PlaceCellNetwork:
             (1.0 + GATING_STRENGTH * jnp.einsum('bs,bsp->bp', vis_stdp, state.W_stdp_to_place))
         all_place_energy = jnp.maximum(0.0, all_place_energy)
 
-        best_mem_energy = jnp.max(all_place_energy, axis=1)
-        total_mem_energy = jnp.sum(all_place_energy, axis=1)
+        # Compute local surprise of expected place cells
+        expected_place_mask = place_barcode
+        I_csnn_place = jnp.einsum('bv,bvp->bp', vis_csnn, state.W_csnn_to_place)
+        I_stdp_place = jnp.einsum('bs,bsp->bp', vis_stdp, state.W_stdp_to_place)
+        I_tof_place  = jnp.einsum('bd,bdp->bp', tof_features, state.W_tof_to_place)
+        primary_senses = I_csnn_place * I_tof_place
+        pure_sensory_place = jnp.maximum(0.0, primary_senses * (1.0 + GATING_STRENGTH * I_stdp_place))
         
-        spatial_match_ratio = best_mem_energy / (total_mem_energy + 1e-8)
-        spatial_novelty_mask = jnp.where(spatial_match_ratio < 0.75, 1.0, 0.0)[:, None, None]
+        expected_energy = jnp.sum(pure_sensory_place * expected_place_mask, axis=1)
+        top_k_energy = jax.lax.top_k(pure_sensory_place, self.k_spikes)[0].sum(axis=1)
+        
+        MATCH_REG_CONST = 0.5
+        match_score = jnp.minimum(expected_energy / (top_k_energy + MATCH_REG_CONST), 1.0)
+        local_surprise = 1.0 - match_score
+        
+        # Neuromodulatory thresholded gate (freeze learning below 0.20 surprise)
+        local_surprise_mask = jnp.where(local_surprise > 0.20, 1.0, 0.0)[:, None, None]
 
         # ---------------------------------------------------------
         # 🌟 THE ASYMMETRIC INSTAR UPGRADE (Fast Learn, Slow Forget)
@@ -265,9 +302,9 @@ class PlaceCellNetwork:
         tof_err_asym  = jnp.where(tof_err > 0, tof_err, tof_err * FORGET_RATE)
 
         # Apply the gated, asymmetric updates
-        dW_cp = eta_saccadic_2d * mask_place * csnn_err_asym * spatial_novelty_mask
-        dW_sp = eta_saccadic_2d * mask_place * stdp_err_asym * spatial_novelty_mask
-        dW_dp = eta_saccadic_2d * mask_place * tof_err_asym  * spatial_novelty_mask
+        dW_cp = eta_saccadic_2d * mask_place * csnn_err_asym * local_surprise_mask
+        dW_sp = eta_saccadic_2d * mask_place * stdp_err_asym * local_surprise_mask
+        dW_dp = eta_saccadic_2d * mask_place * tof_err_asym  * local_surprise_mask
         
         # 🌟 FIX: Global decay applied to ALL sequence weights (not gated by active barcode).
         # Prevents inactive cells from accumulating permanent phantom associations.
@@ -365,18 +402,14 @@ class PlaceCellNetwork:
 
         # 2. Energy in the EXPECTED place cells (the k_spikes cells the
         #    CANN believes should be active at the current pose).
-        expected_energy = jnp.sum(pure_sensory_place * expected_place_mask, axis=1)
+        expected_energy = jnp.sum(I_place_sensory * expected_place_mask, axis=1)
 
-        # 3. Total energy across ALL place cells (the self-consistent
-        #    normalization denominator — same units as the numerator).
-        total_place_energy = jnp.sum(pure_sensory_place, axis=1)
+        # 3. Maximum possible energy across any k_spikes place cells (the local normalization denominator)
+        top_k_energy = jax.lax.top_k(I_place_sensory, self.k_spikes)[0].sum(axis=1)
 
-        # 4. Match score: fraction of total place-cell energy that falls
-        #    in the expected cells.  Bounded [0, 1], scale-invariant.
-        #    - Perfect recognition  → energy concentrated in expected cells → ~1.0
-        #    - Wrong location       → energy elsewhere                     → ~0.0
-        #    - No learned memories  → uniform noise → ~k_spikes/n_place    → ~0.06
-        match_score = jnp.minimum(expected_energy / (total_place_energy + 1e-8), 1.0)
+        # 4. Match score regularized by a background constant
+        MATCH_REG_CONST = 0.5
+        match_score = jnp.minimum(expected_energy / (top_k_energy + MATCH_REG_CONST), 1.0)
         
         # 5. The True Population Surprise Signal
         surprise_signal = 1.0 - match_score

@@ -555,6 +555,7 @@ class SNNSLAMSystem:
         self.vis_act_thresh = 0.01154
         self.alpha_fuse = 0.00435
         self.alpha_acc = 0.18630
+        self._smooth_omega = None
 
     def reset(self, B):
         self.vision_state = self.vision.init_state(B)
@@ -567,6 +568,7 @@ class SNNSLAMSystem:
         self.prev_time_surface = None
         self._theta_gravity = jnp.zeros((B,))
         self._smooth_acc = None
+        self._smooth_omega = None
 
     def reset_pose_only(self, B):
         """🌟 NEW: Resets active pose tracker and temporal traces on crash, but PRESERVES the learned Hebbian map weights (W_seq_to_place, etc.)."""
@@ -591,6 +593,7 @@ class SNNSLAMSystem:
         self.prev_time_surface = None
         self._theta_gravity = jnp.zeros((B,))
         self._smooth_acc = None
+        self._smooth_omega = None
 
     def inject_stdp_memory(self, recovered_stdp_weights):
         """🌟 NEW: Overwrites the live working memory with the episodic Hash Map snapshot."""
@@ -736,18 +739,27 @@ class SNNSLAMSystem:
         return final_pose_est, pose_bump, ring_bump
 
     # 🌟 UPGRADE: Add 'heading' to the signature
-    def phase_mapping(self, dual_vis_features, tof_features, pose_bump, ring_bump, heading, angular_vel):
+    def phase_mapping(self, dual_vis_features, tof_features, pose_bump, ring_bump, heading, angular_vel, confidence=None):
         vis_csnn, vis_stdp = dual_vis_features
         
         self.place_state, (r_place, r_ring) = self.place.forward_mapping(
-            self.place_state, vis_csnn, vis_stdp, tof_features, pose_bump, ring_bump=ring_bump, heading=heading, angular_vel=angular_vel, learn=True
+            self.place_state, vis_csnn, vis_stdp, tof_features, pose_bump, ring_bump=ring_bump, heading=heading, angular_vel=angular_vel, learn=True, confidence=confidence
         )
         
         return r_place, r_ring
 
     def forward_step(self, events_t, kin_t, tof_t, acc_t=None, inject_drift=False, autopilot_on=True, dt=DT):
-        # Pass the flag into phase_perception to pause STDP when surprised
-        dual_vis_features, tof_features = self.phase_perception(events_t, tof_t, learn=autopilot_on)
+        # Gate STDP learning by kinematic stability (angular velocity) to prevent learning visual noise during fast spins/crashes
+        # Low-pass filter the raw angular velocity to smooth out flapping-wing vibrations (115 Hz)
+        if self._smooth_omega is None or self._smooth_omega.shape[0] != kin_t.shape[0]:
+            self._smooth_omega = jnp.zeros_like(kin_t[:, 2])
+        else:
+            alpha_omega = 0.3
+            self._smooth_omega = (1.0 - alpha_omega) * self._smooth_omega + alpha_omega * kin_t[:, 2]
+
+        is_stable = jnp.abs(self._smooth_omega) < self.place.dynamic_saccade_thresh
+        learn_gate = autopilot_on & is_stable[0]
+        dual_vis_features, tof_features = self.phase_perception(events_t, tof_t, learn=learn_gate)
 
         # 🌟 THE UPGRADE: Decode the Grid Key instead of calling estimate_position
         pose_bump_prior = self.pose.get_state_flat()
@@ -804,7 +816,9 @@ class SNNSLAMSystem:
         self.last_decoded_xy = pose_est[:, :2]
 
         # 🌟 UPGRADE: Pass the continuous heading (pose_est[:, 2]) into the mapping phase!
-        r_place, r_ring = self.phase_mapping(dual_vis_features, tof_features, pose_bump, ring_bump, pose_est[:, 2], kin_t[:, 2])
+        r_place, r_ring = self.phase_mapping(dual_vis_features, tof_features, pose_bump, ring_bump, pose_est[:, 2], self._smooth_omega, confidence=None)
+
+        debug_gates = {**debug_gates, "Smooth_Omega": self._smooth_omega, "Learn_Gate": learn_gate}
 
         self._step += 1
         return pose_est, r_place, r_ring, is_confident, peak_idx_place, debug_gates
