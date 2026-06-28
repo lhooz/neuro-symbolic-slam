@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 """
 slam_gate_monitor.py — Monitor SNN SLAM gate statistics over a long run.
@@ -202,7 +203,7 @@ if __name__ == '__main__':
     parser.add_argument('--steps', type=int, default=10000)
     parser.add_argument('--drift', type=int, default=5000)
     parser.add_argument('--record_every', type=int, default=10)
-    parser.add_argument('--output', type=str, default='/Users/lhooz/.openclaw/workspace/gate_monitor.json')
+    parser.add_argument('--output', type=str, default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'gate_monitor.json'))
     args = parser.parse_args()
 
     print(f"Starting gate-monitored run: seed={args.seed}, {args.steps} steps", flush=True)

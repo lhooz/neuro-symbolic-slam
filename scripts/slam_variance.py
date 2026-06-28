@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 """
 slam_variance.py — Trajectory Variance Characterisation
@@ -34,6 +35,9 @@ def run_trial(seed: int, n_steps: int = 2000, drift_start: int = 1000) -> dict:
     system_ol = S.SNNSLAMSystem(random.PRNGKey(42), n_depth=S.N_DEPTH)
     system_cl = S.SNNSLAMSystem(random.PRNGKey(43), n_depth=S.N_DEPTH)
     system_ol.reset(1); system_cl.reset(1)
+    # S3: open-loop = SNN dead-reckoning with NO gravity anchor (K_GRAVITY=0); closed-loop
+    # keeps the gravity-anchored current. Makes OL and CL genuinely different processes.
+    system_ol.pose.K_GRAVITY = 0.0
 
     _, _, _, pos0, th0, _ = env.step()
     system_ol.initialize_pose(jnp.array([pos0]), jnp.array([th0]))
@@ -138,6 +142,11 @@ def run_trial(seed: int, n_steps: int = 2000, drift_start: int = 1000) -> dict:
     imu_arr = np.array(imu_pos_hist[:mn])
     ate_imu = np.mean(np.sqrt((imu_arr[:, 0]-gt[:, 0])**2 + (imu_arr[:, 1]-gt[:, 1])**2))
 
+    # Per-timestep position errors (for time-series plotting)
+    imu_err = np.sqrt((imu_arr[:, 0]-gt[:, 0])**2 + (imu_arr[:, 1]-gt[:, 1])**2)
+    ol_err = np.sqrt((ol_aligned[:, 0]-gt[:, 0])**2 + (ol_aligned[:, 1]-gt[:, 1])**2)
+    cl_err = np.sqrt((cl_aligned[:, 0]-gt[:, 0])**2 + (cl_aligned[:, 1]-gt[:, 1])**2)
+
     return {
         'seed': seed, 'n_steps': mn,
         'ate_imu': float(ate_imu),
@@ -145,6 +154,14 @@ def run_trial(seed: int, n_steps: int = 2000, drift_start: int = 1000) -> dict:
         'ate_cl': float(ate_cl), 'final_cl': float(final_cl),
         'n_loop_closures': len(loop_closures),
         'n_nodes': len(graph_poses),
+        # Per-timestep data for downstream figure generation
+        'imu_err_ts': imu_err,
+        'ol_err_ts': ol_err,
+        'cl_err_ts': cl_err,
+        'gt_pos': gt,
+        'imu_pos': imu_arr,
+        'ol_pos_aligned': ol_aligned,
+        'cl_pos_aligned': cl_aligned,
     }
 
 
@@ -153,8 +170,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--seeds', type=int, default=30, help='Number of random seeds')
     parser.add_argument('--steps', type=int, default=2000, help='Steps per trial')
+    parser.add_argument('--drift-start', type=int, default=1000, help='step at which gyro drift begins')
     parser.add_argument('--output', type=str,
-                       default='/Users/lhooz/.openclaw/workspace/variance_results.json')
+                       default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'variance_results.json'))
     args = parser.parse_args()
 
     n = args.seeds
@@ -163,7 +181,7 @@ def main():
     for i in range(n):
         seed = 42 + i * 111  # deterministic but varied seeds
         print(f"  Trial {i+1}/{n} (seed={seed})...", flush=True)
-        r = run_trial(seed, n_steps=args.steps)
+        r = run_trial(seed, n_steps=args.steps, drift_start=args.drift_start)
         results.append(r)
         elapsed = time.time() - t0
         rate = (i + 1) / elapsed
@@ -199,9 +217,33 @@ def main():
     # Improvement over IMU
     improvement = (np.mean(ate_imu) - np.mean(ate_cl)) / np.mean(ate_imu) * 100
     print(f"  🦊 SNN CL improves over IMU by {improvement:.1f}% (mean ATE)")
+    best_idx = int(np.argmin(ate_cl))
+
+    # Save per-timestep data as numpy archive (JSON can't store arrays)
+    npz_path = args.output.replace('.json', '_timeseries.npz')
+    min_steps = min(r['n_steps'] for r in results)
+    np.savez(npz_path,
+        imu_err_ts=np.array([r['imu_err_ts'][:min_steps] for r in results]),
+        ol_err_ts=np.array([r['ol_err_ts'][:min_steps] for r in results]),
+        cl_err_ts=np.array([r['cl_err_ts'][:min_steps] for r in results]),
+        # Save best trial trajectory (lowest CL ATE) for 2D plot
+        best_gt=results[best_idx]['gt_pos'],
+        best_imu=results[best_idx]['imu_pos'],
+        best_ol=results[best_idx]['ol_pos_aligned'],
+        best_cl=results[best_idx]['cl_pos_aligned'],
+        n_steps=min_steps,
+        dt=S.DT,
+    )
+    print(f"  💾 Time-series data saved: {npz_path}")
+
+    # Strip numpy arrays for JSON serialization
+    json_results = []
+    for r in results:
+        jr = {k: v for k, v in r.items() if not isinstance(v, np.ndarray)}
+        json_results.append(jr)
 
     with open(args.output, 'w') as f:
-        json.dump({'results': results, 'summary': {
+        json.dump({'results': json_results, 'summary': {
             'n_seeds': n, 'n_steps': args.steps,
             'ate_imu_mean': float(np.mean(ate_imu)), 'ate_imu_std': float(np.std(ate_imu)),
             'ate_ol_mean': float(np.mean(ate_ol)), 'ate_ol_std': float(np.std(ate_ol)),
@@ -209,6 +251,7 @@ def main():
             'final_cl_mean': float(np.mean(final_cl)), 'final_cl_std': float(np.std(final_cl)),
             'lcs_mean': float(np.mean(lcs)), 'lcs_std': float(np.std(lcs)),
             'improvement_pct': float(improvement),
+            'best_seed': int(results[best_idx]['seed']),
         }}, f, indent=2, default=str)
     print(f"\n  💾 Results saved: {args.output}")
     print(f"  🕐 Total time: {(time.time()-t0)/60:.1f} min")

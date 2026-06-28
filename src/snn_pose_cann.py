@@ -499,8 +499,11 @@ class PoseCANN:
             self._r_canns[i] = (r_raw / global_inhibition) * baseline_inhibition
 
         # ---- Ring Attractor Substepping ----
-        # Target angle for heading anchor: use integrated IMU heading to match dead-reckoning exactly
-        target_th = self.imu_integrated_th
+        # Anchor target: the ABSOLUTE attitude estimated by the spiking complementary gravity
+        # filter (theta_gravity), when available. This is the gravity-anchored current injection
+        # that bounds drift. Falls back to integrated gyro only if no gravity estimate is passed
+        # (open-loop / unanchored configuration), in which case K_GRAVITY should be 0.
+        target_th = theta_gravity if theta_gravity is not None else self.imu_integrated_th
 
         angles = jnp.arange(RING_N, dtype=jnp.float32) * (2.0 * jnp.pi / RING_N)
         diff = angles[None, :] - target_th[:, None]

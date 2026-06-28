@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 """
 slam_sweep.py — Headless Parameter Sweep for SNN SLAM v7
@@ -367,7 +368,7 @@ def main():
     parser.add_argument('--n_seeds', type=int, default=3, help='Seeds per combo')
     parser.add_argument('--n_steps', type=int, default=2000, help='Sim steps per trial')
     parser.add_argument('--workers', type=int, default=None, help='Parallel workers (default: all CPUs)')
-    parser.add_argument('--output', type=str, default='/Users/lhooz/.openclaw/workspace/sweep_results.json')
+    parser.add_argument('--output', type=str, default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sweep_results.json'))
     args = parser.parse_args()
 
     if args.quick:

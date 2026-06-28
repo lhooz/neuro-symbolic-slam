@@ -92,6 +92,12 @@ TOF_SIGMA       = 0.25   # tof precision
 DRIFT_START     = 5000     # (Offline Default) step at which drift kicks in
 DRIFT_OMEGA     = 0.001  # rad/s artificial yaw drift per timestep
 
+# --- S2: wingbeat vibration injected into the IMU stream (gyro + accelerometer) ---
+VIB_ENABLE      = True
+VIB_FREQ        = 115.0   # Hz wingbeat frequency (undersampled at the 50 Hz estimator rate)
+VIB_GYRO_AMP    = 0.20    # rad/s gyro vibration amplitude
+VIB_ACC_AMP     = 0.50    # m/s^2 accelerometer vibration amplitude
+
 N_TRAJ_SHOW     = 1
 SAVE_FIG        = True
 
@@ -477,13 +483,54 @@ class LiveEnvironment:
         
         self.obstacles = np.array(obs)
         self.ev = np.array(events[0])
-        self.kin = np.array(jnp.stack([labels[0, :, 0] * abs(VX_RANGE[1]), 
-                                       labels[0, :, 1] * abs(VY_RANGE[1]), 
-                                       labels[0, :, 2] * abs(OMEGA_RANGE[1])], axis=1))
+        kin3 = np.array(jnp.stack([labels[0, :, 0] * abs(VX_RANGE[1]),
+                                   labels[0, :, 1] * abs(VY_RANGE[1]),
+                                   labels[0, :, 2] * abs(OMEGA_RANGE[1])], axis=1))
         self.tof = np.array(tof_dists[0])
         self.pos = np.array(positions[0, :, :2])
         self.th = np.array(headings[0])
         self.intensities = np.array(intensities[0])
+
+        # --- Synthesize a proper-acceleration accelerometer (vertical-plane / pitch model) ---
+        # The body attitude theta is a pitch in a sagittal (forward x, vertical z) plane, so
+        # gravity provides a genuine absolute reference. The body-frame proper acceleration is
+        #   a_proper = R(theta)^T (a_world + [0, g]),   g = 9.81 along the vertical (z) axis,
+        # giving arctan2(ax, az) = theta at low linear acceleration -- the signal the spiking
+        # complementary filter fuses with the (drift-prone) gyro to anchor the ring attractor.
+        G = 9.81
+        pw = self.pos.astype(np.float32)
+        N = pw.shape[0]
+        aw = np.zeros((N, 2), dtype=np.float32)
+        if N > 2:
+            aw[1:-1] = (pw[2:] - 2.0 * pw[1:-1] + pw[:-2]) / (DT ** 2)   # world linear accel
+        th = self.th.astype(np.float32)
+        c, s = np.cos(th), np.sin(th)
+        gx = aw[:, 0]
+        gz = aw[:, 1] + G                                                # gravity on the vertical axis
+        ax = c * gx + s * gz
+        az = -s * gx + c * gz
+        seed_acc = int(random.randint(subkey, (), 0, 2**31 - 1))
+        rng_acc = np.random.RandomState(seed_acc)
+        ACC_MEMS_NOISE = 0.05                                            # m/s^2 white MEMS noise (S2 adds 115 Hz vibration)
+        ax = ax + rng_acc.normal(0.0, ACC_MEMS_NOISE, N).astype(np.float32)
+        az = az + rng_acc.normal(0.0, ACC_MEMS_NOISE, N).astype(np.float32)
+
+        # --- S2: wingbeat vibration on the IMU (gyro + accelerometer) ---
+        # The flapping wingbeat (~115 Hz) mechanically shakes the IMU. The state estimator
+        # samples at 1/DT = 50 Hz, so the 115 Hz wingbeat is undersampled and manifests as a
+        # large aliased high-frequency disturbance on every IMU channel; the filter's accel
+        # low-pass (alpha_acc) and the LIF membrane time constant must reject it. We model the
+        # disturbance as the wingbeat sinusoid sampled at the estimator rate (see Methods).
+        if VIB_ENABLE:
+            t_arr = np.arange(N, dtype=np.float32) * DT
+            phase = 2.0 * np.pi * VIB_FREQ * t_arr
+            kin3[:, 2] = kin3[:, 2] + VIB_GYRO_AMP * np.sin(phase)        # gyro (rad/s)
+            ax = ax + VIB_ACC_AMP * np.sin(phase)
+            az = az + VIB_ACC_AMP * np.cos(phase)
+
+        acc = np.stack([ax, az], axis=1).astype(np.float32)
+        # kin now carries [vx, vy, omega, ax, az]; forward_step reads acc from columns 3:5.
+        self.kin = np.concatenate([kin3, acc], axis=1).astype(np.float32)
         self.t = 0
 
     def step(self):
@@ -553,8 +600,11 @@ class SNNSLAMSystem:
         self.psr_thresh = 4.49000
         self.psr_range = 4.84275
         self.vis_act_thresh = 0.01154
-        self.alpha_fuse = 0.00435
-        self.alpha_acc = 0.18630
+        # Complementary-filter accelerometer-correction gain: new = (1-a)*gyro + a*accel.
+        # a=0.02 keeps the gyro for high-frequency motion while the gravity (accel) estimate
+        # corrects low-frequency drift -- i.e. 0.98 gyro / 0.02 accel, the manuscript's split.
+        self.alpha_fuse = 0.02
+        self.alpha_acc = 0.18630   # EMA low-pass on raw accel to suppress wingbeat vibration
         self._smooth_omega = None
 
     def reset(self, B):
@@ -749,6 +799,10 @@ class SNNSLAMSystem:
         return r_place, r_ring
 
     def forward_step(self, events_t, kin_t, tof_t, acc_t=None, inject_drift=False, autopilot_on=True, dt=DT):
+        # Accelerometer is carried in kin columns 3:5 ([vx, vy, omega, ax, az]); extract it so
+        # the spiking complementary gravity filter runs (closed-loop / anchored configuration).
+        if acc_t is None and kin_t.shape[1] >= 5:
+            acc_t = kin_t[:, 3:5]
         # Gate STDP learning by kinematic stability (angular velocity) to prevent learning visual noise during fast spins/crashes
         # Low-pass filter the raw angular velocity to smooth out flapping-wing vibrations (115 Hz)
         if self._smooth_omega is None or self._smooth_omega.shape[0] != kin_t.shape[0]:
